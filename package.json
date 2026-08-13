@@ -1,0 +1,29 @@
+{
+  "name": "robinhood-lp-position",
+  "version": "1.0.0",
+  "description": "Robinhood Chain Uniswap LP position CLI",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@uniswap/sdk-core": "^7.19.0",
+    "@uniswap/v3-sdk": "^3.31.1",
+    "dotenv": "^17.4.2",
+    "jsbi": "^4.3.2",
+    "viem": "^2.55.13",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
+  }
+}
