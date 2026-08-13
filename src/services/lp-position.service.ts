@@ -2,6 +2,7 @@ import { getAddress, type Address } from 'viem';
 import { z } from 'zod';
 
 import { ROBINHOOD_CHAIN, UNISWAP_CONTRACTS } from '../constants/chain.js';
+import { fetchJson } from '../lib/http.js';
 import { publicClient } from '../lib/public-client.js';
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
@@ -9,7 +10,7 @@ const BLOCKSCOUT_API_BASE = 'https://robinhoodchain.blockscout.com/api';
 const MAX_UINT128 = (2n ** 128n) - 1n;
 const MAX_UINT256 = (2n ** 256n) - 1n;
 
-const walletInputSchema = z.object({
+export const walletInputSchema = z.object({
   wallet: z
     .string()
     .regex(/^0x[a-fA-F0-9]{40}$/, 'wallet must be a valid EVM address')
@@ -20,13 +21,13 @@ const walletInputSchema = z.object({
 
 export type ProtocolFilter = z.infer<typeof walletInputSchema>['protocol'];
 
-type TokenMetadata = {
+export type TokenMetadata = {
   address: Address;
   symbol: string;
   decimals: number;
 };
 
-type V2Position = {
+export type V2Position = {
   protocol: 'v2';
   pairAddress: Address;
   pairSymbol: string;
@@ -37,7 +38,7 @@ type V2Position = {
   token1: TokenMetadata & { principal: string };
 };
 
-type V3Position = {
+export type V3Position = {
   protocol: 'v3';
   tokenId: string;
   poolAddress: Address;
@@ -45,6 +46,7 @@ type V3Position = {
   tickLower: number;
   tickUpper: number;
   tickCurrent: number;
+  sqrtPriceX96: string;
   inRange: boolean;
   liquidity: string;
   token0: TokenMetadata & {
@@ -57,7 +59,7 @@ type V3Position = {
   };
 };
 
-type V4Position = {
+export type V4Position = {
   protocol: 'v4';
   tokenId: string;
   liquidity: string | null;
@@ -76,7 +78,7 @@ type V4Position = {
   readError?: string;
 };
 
-type AnyPosition = V2Position | V3Position | V4Position;
+export type AnyPosition = V2Position | V3Position | V4Position;
 
 export type WalletLpReadResult = {
   wallet: Address;
@@ -103,20 +105,25 @@ type BlockscoutTokenItem = {
   type: string;
 };
 
-type BlockscoutTokenListResponse = {
-  message: string;
-  status: string;
-  result: BlockscoutTokenItem[] | string;
+type BlockscoutV2PageParams = Record<string, string | number | boolean | null>;
+
+type BlockscoutV2ListResponse<T> = {
+  items: T[];
+  next_page_params: BlockscoutV2PageParams | null;
 };
 
-type BlockscoutNftTxItem = {
-  tokenID: string;
+type BlockscoutV2TokenBalanceItem = {
+  token: {
+    address_hash: string;
+    symbol: string | null;
+    decimals: string | null;
+    type: string;
+  };
+  value: string;
 };
 
-type BlockscoutNftTxResponse = {
-  message: string;
-  status: string;
-  result: BlockscoutNftTxItem[] | string;
+type BlockscoutV2NftInstanceItem = {
+  id: string;
 };
 
 const erc20MetadataAbi = [
@@ -374,7 +381,7 @@ export async function getWalletUniswapPositions(input: unknown): Promise<WalletL
       'Uniswap v2 positions are identified from wallet-held ERC-20s and verified against Uniswap v2 factory.',
       'Uniswap v3 positions include principal and uncollected fees via static simulation.',
       'Uniswap v4 positions are discovered from Blockscout NFT transfer history, then verified by ownerOf.',
-      'USD valuation, realized PnL, and historical liquidity-added tracking will be added next.',
+      'Run `track` to persist a snapshot and diff it against the previous one for PnL-style tracking.',
     ],
   };
 }
@@ -528,6 +535,7 @@ async function readV3Positions(owner: Address): Promise<V3Position[]> {
         : await safeSimulateDecrease(positionManager, owner, tokenId, positionLiquidity);
 
     const tickCurrent = Number(slot0[1]);
+    const sqrtPriceX96 = slot0[0];
 
     return {
       protocol: 'v3',
@@ -537,6 +545,7 @@ async function readV3Positions(owner: Address): Promise<V3Position[]> {
       tickLower,
       tickUpper,
       tickCurrent,
+      sqrtPriceX96: sqrtPriceX96.toString(),
       inRange: tickCurrent >= tickLower && tickCurrent < tickUpper,
       liquidity: positionLiquidity.toString(),
       token0: {
@@ -720,73 +729,61 @@ function signed24(raw: number): number {
 }
 
 async function fetchWalletTokenList(owner: Address): Promise<BlockscoutTokenItem[]> {
-  const url = new URL(BLOCKSCOUT_API_BASE);
-  url.searchParams.set('module', 'account');
-  url.searchParams.set('action', 'tokenlist');
-  url.searchParams.set('address', owner);
+  const items: BlockscoutTokenItem[] = [];
+  let pageParams: BlockscoutV2PageParams | null = { type: 'ERC-20' };
 
-  const data = await fetchJson<BlockscoutTokenListResponse>(url.toString());
-  if (!Array.isArray(data.result)) return [];
+  while (pageParams) {
+    const url = new URL(`${BLOCKSCOUT_API_BASE}/v2/addresses/${owner.toLowerCase()}/tokens`);
+    for (const [key, value] of Object.entries(pageParams)) {
+      if (value !== null && value !== '') url.searchParams.set(key, String(value));
+    }
 
-  return data.result;
+    const data = await fetchJson<BlockscoutV2ListResponse<BlockscoutV2TokenBalanceItem>>(
+      url.toString(),
+    );
+
+    for (const item of data.items) {
+      items.push({
+        balance: item.value,
+        contractAddress: item.token.address_hash,
+        decimals: item.token.decimals ?? '0',
+        name: '',
+        symbol: item.token.symbol ?? '',
+        type: item.token.type,
+      });
+    }
+
+    pageParams = data.next_page_params;
+  }
+
+  return items;
 }
 
 async function fetchWalletNftTokenIds(owner: Address, contractAddress: Address): Promise<bigint[]> {
   const collected = new Set<bigint>();
+  let pageParams: BlockscoutV2PageParams | null = { holder_address_hash: owner };
 
-  let page = 1;
-  const offset = 100;
+  while (pageParams) {
+    const url = new URL(
+      `${BLOCKSCOUT_API_BASE}/v2/tokens/${contractAddress.toLowerCase()}/instances`,
+    );
+    for (const [key, value] of Object.entries(pageParams)) {
+      if (value !== null && value !== '') url.searchParams.set(key, String(value));
+    }
 
-  while (true) {
-    const url = new URL(BLOCKSCOUT_API_BASE);
-    url.searchParams.set('module', 'account');
-    url.searchParams.set('action', 'tokennfttx');
-    url.searchParams.set('address', owner);
-    url.searchParams.set('contractaddress', contractAddress);
-    url.searchParams.set('page', String(page));
-    url.searchParams.set('offset', String(offset));
-    url.searchParams.set('sort', 'asc');
+    const data = await fetchJson<BlockscoutV2ListResponse<BlockscoutV2NftInstanceItem>>(
+      url.toString(),
+    );
 
-    const data = await fetchJson<BlockscoutNftTxResponse>(url.toString());
-    if (!Array.isArray(data.result) || data.result.length === 0) break;
-
-    for (const item of data.result) {
-      const tokenId = parseBigInt(item.tokenID);
+    for (const item of data.items) {
+      const tokenId = parseBigInt(item.id);
       if (tokenId > 0n) collected.add(tokenId);
     }
 
-    if (data.result.length < offset) break;
-    page += 1;
+    pageParams = data.next_page_params;
   }
 
   return [...collected];
-}
-
-async function fetchJson<T>(url: string): Promise<T> {
-  let lastError: string | null = null;
-
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const response = await fetch(url, {
-        method: 'GET',
-        headers: {
-          Accept: 'application/json',
-        },
-      });
-
-      if (!response.ok) {
-        lastError = `HTTP ${response.status} while requesting ${url}`;
-      } else {
-        return (await response.json()) as T;
-      }
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
-    }
-
-    await delay(250 * attempt);
-  }
-
-  throw new Error(lastError ?? `Unknown HTTP error while requesting ${url}`);
 }
 
 async function getTokenMetadata(address: Address): Promise<TokenMetadata> {
