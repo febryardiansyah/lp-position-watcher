@@ -1,7 +1,7 @@
 import { getAddress, type Address } from 'viem';
 
 import { fetchJson } from '../lib/http.js';
-import type { AnyPosition } from './lp-position.service.js';
+import type { AnyPosition, TokenMetadata } from './lp-position.service.js';
 
 const BLOCKSCOUT_API_BASE = 'https://robinhoodchain.blockscout.com/api';
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
@@ -148,16 +148,6 @@ export function positionKey(position: AnyPosition): string {
 }
 
 export async function valuePosition(position: AnyPosition): Promise<PositionValuation> {
-  if (position.protocol === 'v4') {
-    return {
-      totalUsd: null,
-      principalUsd: null,
-      feesUsd: null,
-      token0: { priceUsd: null, valueUsd: null },
-      token1: { priceUsd: null, valueUsd: null },
-    };
-  }
-
   if (position.protocol === 'v2') {
     const prices = await resolvePairPrices({
       token0: position.token0.address,
@@ -187,18 +177,48 @@ export async function valuePosition(position: AnyPosition): Promise<PositionValu
     };
   }
 
+  if (position.protocol === 'v3') {
+    return valueConcentrated({
+      sqrtPriceX96: position.sqrtPriceX96,
+      token0: position.token0,
+      token1: position.token1,
+    });
+  }
+
+  if (position.sqrtPriceX96 === null || position.token0 === null || position.token1 === null) {
+    return {
+      totalUsd: null,
+      principalUsd: null,
+      feesUsd: null,
+      token0: { priceUsd: null, valueUsd: null },
+      token1: { priceUsd: null, valueUsd: null },
+    };
+  }
+
+  return valueConcentrated({
+    sqrtPriceX96: position.sqrtPriceX96,
+    token0: position.token0,
+    token1: position.token1,
+  });
+}
+
+async function valueConcentrated(args: {
+  sqrtPriceX96: string;
+  token0: TokenMetadata & { principal: string; uncollectedFees: string };
+  token1: TokenMetadata & { principal: string; uncollectedFees: string };
+}): Promise<PositionValuation> {
   const prices = await resolvePairPrices({
-    token0: position.token0.address,
-    token1: position.token1.address,
-    decimals0: position.token0.decimals,
-    decimals1: position.token1.decimals,
-    pool: { kind: 'v3', sqrtPriceX96: position.sqrtPriceX96 },
+    token0: args.token0.address,
+    token1: args.token1.address,
+    decimals0: args.token0.decimals,
+    decimals1: args.token1.decimals,
+    pool: { kind: 'v3', sqrtPriceX96: args.sqrtPriceX96 },
   });
 
-  const principal0 = Number(position.token0.principal);
-  const principal1 = Number(position.token1.principal);
-  const fees0 = Number(position.token0.uncollectedFees);
-  const fees1 = Number(position.token1.uncollectedFees);
+  const principal0 = Number(args.token0.principal);
+  const principal1 = Number(args.token1.principal);
+  const fees0 = Number(args.token0.uncollectedFees);
+  const fees1 = Number(args.token1.uncollectedFees);
 
   const principal0Value = valueToken(principal0, prices.price0);
   const principal1Value = valueToken(principal1, prices.price1);

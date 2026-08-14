@@ -225,6 +225,17 @@ function diffPositionFields(previous: AnyPosition, current: AnyPosition): Positi
     pushIfChanged('liquidity', previous.liquidity ?? '', current.liquidity ?? '');
     pushIfChanged('tickLower', previous.tickLower ?? '', current.tickLower ?? '');
     pushIfChanged('tickUpper', previous.tickUpper ?? '', current.tickUpper ?? '');
+    pushIfChanged('tickCurrent', previous.tickCurrent ?? '', current.tickCurrent ?? '');
+    pushIfChanged('inRange', previous.inRange ?? '', current.inRange ?? '');
+
+    if (previous.token0 && current.token0) {
+      pushIfChanged('principal0', previous.token0.principal, current.token0.principal);
+      pushIfChanged('uncollectedFees0', previous.token0.uncollectedFees, current.token0.uncollectedFees);
+    }
+    if (previous.token1 && current.token1) {
+      pushIfChanged('principal1', previous.token1.principal, current.token1.principal);
+      pushIfChanged('uncollectedFees1', previous.token1.uncollectedFees, current.token1.uncollectedFees);
+    }
   }
 
   return fields;
@@ -261,6 +272,9 @@ function positionLabel(position: AnyPosition): string {
   if (position.protocol === 'v2') return `v2 ${position.pairSymbol}`;
   if (position.protocol === 'v3') {
     return `v3 #${position.tokenId} ${position.token0.symbol}/${position.token1.symbol}`;
+  }
+  if (position.token0 && position.token1) {
+    return `v4 #${position.tokenId} ${position.token0.symbol}/${position.token1.symbol}`;
   }
   return `v4 #${position.tokenId}`;
 }

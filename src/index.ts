@@ -4,13 +4,14 @@ import { getAddress } from 'viem';
 
 import { env } from './config/env.js';
 import { getWalletUniswapPositions } from './services/lp-position.service.js';
+import { renderPortfolio } from './services/portfolio-view.service.js';
 import {
   getWalletDiff,
   getWalletHistory,
   summarizeChanges,
   trackWalletPositions,
 } from './services/tracker.service.js';
-import { formatUsd } from './services/valuation.service.js';
+import { formatUsd, valuePositions } from './services/valuation.service.js';
 
 function rpcHints(errorMessage: string): string[] {
   const hints: string[] = [];
@@ -27,8 +28,9 @@ function rpcHints(errorMessage: string): string[] {
 }
 
 const USAGE = `Usage:
-  npm run dev -- <walletAddress>            Read current Uniswap LP positions (v2/v3/v4)
+  npm run dev -- <walletAddress>            Show LP portfolio (like lpagent.io) for a wallet
   npm run dev -- positions <walletAddress>  Same as above
+  npm run dev -- positions --json <wallet>  Show raw JSON position data
   npm run dev -- track <walletAddress>      Record a valuation snapshot and report changes since last one
   npm run dev -- history <walletAddress>    List recorded snapshots for a wallet
   npm run dev -- diff <walletAddress>       Diff the two most recent snapshots
@@ -54,6 +56,10 @@ function resolveWallet(walletArg: string | undefined): string {
 
 async function main() {
   const args = process.argv.slice(2);
+  const jsonIndex = args.indexOf('--json');
+  const jsonOutput = jsonIndex !== -1;
+  if (jsonOutput) args.splice(jsonIndex, 1);
+
   const first = args[0];
 
   const isCommand = !!first && !first.startsWith('0x');
@@ -75,7 +81,15 @@ async function main() {
   switch (command) {
     case 'positions':
     case 'read': {
-      console.log(JSON.stringify(await getWalletUniswapPositions(input), null, 2));
+      const read = await getWalletUniswapPositions(input);
+
+      if (jsonOutput) {
+        console.log(JSON.stringify(read, null, 2));
+        return;
+      }
+
+      const valuation = await valuePositions(read.positions);
+      console.log(renderPortfolio(read, valuation));
       return;
     }
 

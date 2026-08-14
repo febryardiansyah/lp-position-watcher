@@ -1,4 +1,4 @@
-import { getAddress, type Address } from 'viem';
+import { encodeAbiParameters, getAddress, keccak256, type Address } from 'viem';
 import { z } from 'zod';
 
 import { ROBINHOOD_CHAIN, UNISWAP_CONTRACTS } from '../constants/chain.js';
@@ -34,6 +34,7 @@ export type V2Position = {
   lpBalance: string;
   lpTotalSupply: string;
   poolSharePct: string;
+  createdAt: string | null;
   token0: TokenMetadata & { principal: string };
   token1: TokenMetadata & { principal: string };
 };
@@ -49,6 +50,7 @@ export type V3Position = {
   sqrtPriceX96: string;
   inRange: boolean;
   liquidity: string;
+  createdAt: string | null;
   token0: TokenMetadata & {
     principal: string;
     uncollectedFees: string;
@@ -65,7 +67,12 @@ export type V4Position = {
   liquidity: string | null;
   tickLower: number | null;
   tickUpper: number | null;
+  tickCurrent: number | null;
+  sqrtPriceX96: string | null;
+  inRange: boolean | null;
+  lpFee: number | null;
   hasSubscriber: boolean | null;
+  createdAt: string | null;
   poolKey: {
     currency0: Address;
     currency1: Address;
@@ -73,8 +80,18 @@ export type V4Position = {
     tickSpacing: number;
     hooks: Address;
   } | null;
-  token0: TokenMetadata | null;
-  token1: TokenMetadata | null;
+  token0:
+    | (TokenMetadata & {
+        principal: string;
+        uncollectedFees: string;
+      })
+    | null;
+  token1:
+    | (TokenMetadata & {
+        principal: string;
+        uncollectedFees: string;
+      })
+    | null;
   readError?: string;
 };
 
@@ -340,6 +357,52 @@ const v4PositionManagerAbi = [
   },
 ] as const;
 
+const v4StateViewAbi = [
+  {
+    type: 'function',
+    name: 'getSlot0',
+    stateMutability: 'view',
+    inputs: [{ name: 'poolId', type: 'bytes32' }],
+    outputs: [
+      { name: 'sqrtPriceX96', type: 'uint160' },
+      { name: 'tick', type: 'int24' },
+      { name: 'protocolFee', type: 'uint24' },
+      { name: 'lpFee', type: 'uint24' },
+    ],
+  },
+  {
+    type: 'function',
+    name: 'getPositionInfo',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'poolId', type: 'bytes32' },
+      { name: 'owner', type: 'address' },
+      { name: 'tickLower', type: 'int24' },
+      { name: 'tickUpper', type: 'int24' },
+      { name: 'salt', type: 'bytes32' },
+    ],
+    outputs: [
+      { name: 'liquidity', type: 'uint128' },
+      { name: 'feeGrowthInside0LastX128', type: 'uint256' },
+      { name: 'feeGrowthInside1LastX128', type: 'uint256' },
+    ],
+  },
+  {
+    type: 'function',
+    name: 'getFeeGrowthInside',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'poolId', type: 'bytes32' },
+      { name: 'tickLower', type: 'int24' },
+      { name: 'tickUpper', type: 'int24' },
+    ],
+    outputs: [
+      { name: 'feeGrowthInside0X128', type: 'uint256' },
+      { name: 'feeGrowthInside1X128', type: 'uint256' },
+    ],
+  },
+] as const;
+
 const tokenMetadataCache = new Map<string, Promise<TokenMetadata>>();
 
 export async function getWalletUniswapPositions(input: unknown): Promise<WalletLpReadResult> {
@@ -381,6 +444,7 @@ export async function getWalletUniswapPositions(input: unknown): Promise<WalletL
       'Uniswap v2 positions are identified from wallet-held ERC-20s and verified against Uniswap v2 factory.',
       'Uniswap v3 positions include principal and uncollected fees via static simulation.',
       'Uniswap v4 positions are discovered from Blockscout NFT transfer history, then verified by ownerOf.',
+      'v4 amounts, in-range status, and uncollected fees are read from the v4 StateView contract (pool slot0, position info, fee growth).',
       'Run `track` to persist a snapshot and diff it against the previous one for PnL-style tracking.',
     ],
   };
@@ -443,9 +507,10 @@ async function readV2Positions(owner: Address): Promise<V2Position[]> {
     const token0Address = getAddress(token0Raw);
     const token1Address = getAddress(token1Raw);
 
-    const [token0Meta, token1Meta] = await Promise.all([
+    const [token0Meta, token1Meta, createdAt] = await Promise.all([
       getTokenMetadata(token0Address),
       getTokenMetadata(token1Address),
+      fetchV2PairCreatedAt(pairAddress),
     ]);
 
     const principal0Raw = (reserves[0] * lpBalance) / totalSupply;
@@ -458,6 +523,7 @@ async function readV2Positions(owner: Address): Promise<V2Position[]> {
       lpBalance: lpBalance.toString(),
       lpTotalSupply: totalSupply.toString(),
       poolSharePct: formatPercent(lpBalance, totalSupply, 6),
+      createdAt,
       token0: {
         ...token0Meta,
         principal: formatUnits(principal0Raw, token0Meta.decimals),
@@ -518,7 +584,7 @@ async function readV3Positions(owner: Address): Promise<V3Position[]> {
 
     if (poolAddress === ZERO_ADDRESS) return null;
 
-    const [token0Meta, token1Meta, slot0] = await Promise.all([
+    const [token0Meta, token1Meta, slot0, createdAt] = await Promise.all([
       getTokenMetadata(token0Address),
       getTokenMetadata(token1Address),
       publicClient.readContract({
@@ -526,6 +592,7 @@ async function readV3Positions(owner: Address): Promise<V3Position[]> {
         abi: v3PoolAbi,
         functionName: 'slot0',
       }),
+      fetchNftCreatedAt(positionManager, tokenId),
     ]);
 
     const simulatedCollect = await safeSimulateCollect(positionManager, owner, tokenId);
@@ -548,6 +615,7 @@ async function readV3Positions(owner: Address): Promise<V3Position[]> {
       sqrtPriceX96: sqrtPriceX96.toString(),
       inRange: tickCurrent >= tickLower && tickCurrent < tickUpper,
       liquidity: positionLiquidity.toString(),
+      createdAt,
       token0: {
         ...token0Meta,
         principal: formatUnits(simulatedDecrease[0], token0Meta.decimals),
@@ -566,11 +634,12 @@ async function readV3Positions(owner: Address): Promise<V3Position[]> {
 
 async function readV4Positions(owner: Address): Promise<V4Position[]> {
   const positionManager = UNISWAP_CONTRACTS.v4PositionManager as Address;
+  const stateView = UNISWAP_CONTRACTS.v4StateView as Address;
 
   const tokenIds = await fetchWalletNftTokenIds(owner, positionManager);
   if (tokenIds.length === 0) return [];
 
-  const currentlyOwnedTokenIds = await mapInBatches(tokenIds, 1, async (tokenId) => {
+  const currentlyOwnedTokenIds = await mapInBatches(tokenIds, 4, async (tokenId) => {
     try {
       const ownerNow = await withRetries(() =>
         publicClient.readContract({
@@ -589,7 +658,7 @@ async function readV4Positions(owner: Address): Promise<V4Position[]> {
 
   const ownedTokenIds = currentlyOwnedTokenIds.filter((id): id is bigint => id !== null);
 
-  const positions = await mapInBatches(ownedTokenIds, 1, async (tokenId) => {
+  const positions = await mapInBatches(ownedTokenIds, 4, async (tokenId) => {
     try {
       const poolAndInfo = await withRetries(() =>
         publicClient.readContract({
@@ -600,21 +669,73 @@ async function readV4Positions(owner: Address): Promise<V4Position[]> {
         }),
       );
 
-      const liquidity = await withRetries(() =>
-        publicClient.readContract({
-          address: positionManager,
-          abi: v4PositionManagerAbi,
-          functionName: 'getPositionLiquidity',
-          args: [tokenId],
-        }),
-      );
-
       const poolKey = poolAndInfo[0];
       const packedInfo = poolAndInfo[1];
       const decoded = decodeV4Info(packedInfo);
 
       const currency0 = getAddress(poolKey.currency0);
       const currency1 = getAddress(poolKey.currency1);
+
+      const poolId = computeV4PoolId({
+        currency0: poolKey.currency0,
+        currency1: poolKey.currency1,
+        fee: poolKey.fee,
+        tickSpacing: poolKey.tickSpacing,
+        hooks: poolKey.hooks,
+      });
+      const salt = toBytes32(tokenId);
+
+      const [slot0, posInfo, feeGrowthInside, createdAt] = await Promise.all([
+        withRetries(() =>
+          publicClient.readContract({
+            address: stateView,
+            abi: v4StateViewAbi,
+            functionName: 'getSlot0',
+            args: [poolId],
+          }),
+        ),
+        withRetries(() =>
+          publicClient.readContract({
+            address: stateView,
+            abi: v4StateViewAbi,
+            functionName: 'getPositionInfo',
+            args: [poolId, positionManager, decoded.tickLower, decoded.tickUpper, salt],
+          }),
+        ),
+        withRetries(() =>
+          publicClient.readContract({
+            address: stateView,
+            abi: v4StateViewAbi,
+            functionName: 'getFeeGrowthInside',
+            args: [poolId, decoded.tickLower, decoded.tickUpper],
+          }),
+        ),
+        fetchNftCreatedAt(positionManager, tokenId),
+      ]);
+
+      const liquidity = posInfo[0];
+      const tickCurrent = Number(slot0[1]);
+      const sqrtPriceX96 = slot0[0];
+      const inRange = tickCurrent >= decoded.tickLower && tickCurrent < decoded.tickUpper;
+
+      const uncollectedFees0 = calculateUncollectedFees(
+        feeGrowthInside[0],
+        posInfo[1],
+        liquidity,
+      );
+      const uncollectedFees1 = calculateUncollectedFees(
+        feeGrowthInside[1],
+        posInfo[2],
+        liquidity,
+      );
+
+      const [amount0, amount1] = liquidityAmounts(
+        sqrtPriceX96,
+        decoded.tickLower,
+        decoded.tickUpper,
+        tickCurrent,
+        liquidity,
+      );
 
       const [token0Meta, token1Meta] = await Promise.all([
         getTokenMetadata(currency0),
@@ -627,7 +748,12 @@ async function readV4Positions(owner: Address): Promise<V4Position[]> {
         liquidity: liquidity.toString(),
         tickLower: decoded.tickLower,
         tickUpper: decoded.tickUpper,
+        tickCurrent,
+        sqrtPriceX96: sqrtPriceX96.toString(),
+        inRange,
+        lpFee: Number(slot0[3]),
         hasSubscriber: decoded.hasSubscriber,
+        createdAt,
         poolKey: {
           currency0,
           currency1,
@@ -635,8 +761,16 @@ async function readV4Positions(owner: Address): Promise<V4Position[]> {
           tickSpacing: Number(poolKey.tickSpacing),
           hooks: getAddress(poolKey.hooks),
         },
-        token0: token0Meta,
-        token1: token1Meta,
+        token0: {
+          ...token0Meta,
+          principal: formatUnits(amount0, token0Meta.decimals),
+          uncollectedFees: formatUnits(uncollectedFees0, token0Meta.decimals),
+        },
+        token1: {
+          ...token1Meta,
+          principal: formatUnits(amount1, token1Meta.decimals),
+          uncollectedFees: formatUnits(uncollectedFees1, token1Meta.decimals),
+        },
       } satisfies V4Position;
     } catch (error) {
       return {
@@ -645,7 +779,12 @@ async function readV4Positions(owner: Address): Promise<V4Position[]> {
         liquidity: null,
         tickLower: null,
         tickUpper: null,
+        tickCurrent: null,
+        sqrtPriceX96: null,
+        inRange: null,
+        lpFee: null,
         hasSubscriber: null,
+        createdAt: null,
         poolKey: null,
         token0: null,
         token1: null,
@@ -655,6 +794,123 @@ async function readV4Positions(owner: Address): Promise<V4Position[]> {
   });
 
   return positions;
+}
+
+function computeV4PoolId(poolKey: {
+  currency0: Address;
+  currency1: Address;
+  fee: number;
+  tickSpacing: number;
+  hooks: Address;
+}): `0x${string}` {
+  return keccak256(
+    encodeAbiParameters(
+      [
+        { type: 'address' },
+        { type: 'address' },
+        { type: 'uint24' },
+        { type: 'int24' },
+        { type: 'address' },
+      ],
+      [
+        poolKey.currency0,
+        poolKey.currency1,
+        poolKey.fee,
+        poolKey.tickSpacing,
+        poolKey.hooks,
+      ],
+    ),
+  );
+}
+
+function toBytes32(value: bigint): `0x${string}` {
+  return `0x${value.toString(16).padStart(64, '0')}`;
+}
+
+function calculateUncollectedFees(
+  feeGrowthInsideNow: bigint,
+  feeGrowthInsideLast: bigint,
+  liquidity: bigint,
+): bigint {
+  if (liquidity === 0n) return 0n;
+  if (feeGrowthInsideNow < feeGrowthInsideLast) return 0n;
+  const delta = feeGrowthInsideNow - feeGrowthInsideLast;
+  return (delta * liquidity) / (2n ** 128n);
+}
+
+function liquidityAmounts(
+  sqrtPriceX96: bigint,
+  tickLower: number,
+  tickUpper: number,
+  tickCurrent: number,
+  liquidity: bigint,
+): [bigint, bigint] {
+  if (liquidity === 0n) return [0n, 0n];
+
+  const sqrtLower = sqrtRatioAtTick(tickLower);
+  const sqrtUpper = sqrtRatioAtTick(tickUpper);
+  const sqrtCurrent = sqrtPriceX96;
+
+  if (tickCurrent < tickLower) {
+    return [getAmount0Delta(sqrtLower, sqrtUpper, liquidity), 0n];
+  }
+
+  if (tickCurrent >= tickUpper) {
+    return [0n, getAmount1Delta(sqrtLower, sqrtUpper, liquidity)];
+  }
+
+  return [
+    getAmount0Delta(sqrtCurrent, sqrtUpper, liquidity),
+    getAmount1Delta(sqrtLower, sqrtCurrent, liquidity),
+  ];
+}
+
+function getAmount0Delta(sqrtRatioAX96: bigint, sqrtRatioBX96: bigint, liquidity: bigint): bigint {
+  const [min, max] = sqrtRatioAX96 < sqrtRatioBX96
+    ? [sqrtRatioAX96, sqrtRatioBX96]
+    : [sqrtRatioBX96, sqrtRatioAX96];
+  const Q96 = 2n ** 96n;
+  return (liquidity * (max - min) * Q96) / (max * min);
+}
+
+function getAmount1Delta(sqrtRatioAX96: bigint, sqrtRatioBX96: bigint, liquidity: bigint): bigint {
+  const [min, max] = sqrtRatioAX96 < sqrtRatioBX96
+    ? [sqrtRatioAX96, sqrtRatioBX96]
+    : [sqrtRatioBX96, sqrtRatioAX96];
+  const Q96 = 2n ** 96n;
+  return (liquidity * (max - min)) / Q96;
+}
+
+function sqrtRatioAtTick(tick: number): bigint {
+  if (tick <= -887272) return 4295128739n;
+  if (tick >= 887272) return 1461446703485210103287273052203988822378723970341n;
+
+  const absTick = Math.abs(tick);
+  let ratio = (absTick & 1) !== 0 ? 0xfffcb933bd6fad37aa2d162d1a594001n : 0x100000000000000000000000000000000n;
+
+  if ((absTick & 2) !== 0) ratio = (ratio * 0xfff97272373d413259a46990580e213an) >> 128n;
+  if ((absTick & 4) !== 0) ratio = (ratio * 0xfff2e50f5f656932ef12357cf3c7fdccn) >> 128n;
+  if ((absTick & 8) !== 0) ratio = (ratio * 0xffe5caca7e10e4e61c3624eaa0941cd0n) >> 128n;
+  if ((absTick & 16) !== 0) ratio = (ratio * 0xffcb9843d60f6159c9db58835c926644n) >> 128n;
+  if ((absTick & 32) !== 0) ratio = (ratio * 0xff973b41fa98c081472e6896dfb254c0n) >> 128n;
+  if ((absTick & 64) !== 0) ratio = (ratio * 0xff2ea16466c96a3843ec78b326b52861n) >> 128n;
+  if ((absTick & 128) !== 0) ratio = (ratio * 0xfe5dee046a99a2a811c461f1969c3053n) >> 128n;
+  if ((absTick & 256) !== 0) ratio = (ratio * 0xfcbe86c7900a88aedcffc83b479aa3a4n) >> 128n;
+  if ((absTick & 512) !== 0) ratio = (ratio * 0xf987a7253ac413176f2b074cf7815e54n) >> 128n;
+  if ((absTick & 1024) !== 0) ratio = (ratio * 0xf3392b0822b70005940c7a398e4b70f3n) >> 128n;
+  if ((absTick & 2048) !== 0) ratio = (ratio * 0xe7159475a2c29b7443b29c7fa6e889d9n) >> 128n;
+  if ((absTick & 4096) !== 0) ratio = (ratio * 0xd097f3bdfd2022b8845ad8f792aa5825n) >> 128n;
+  if ((absTick & 8192) !== 0) ratio = (ratio * 0xa9f746462d870fdf8a65dc1f90e061e5n) >> 128n;
+  if ((absTick & 16384) !== 0) ratio = (ratio * 0x70d869a156d2a1b890bb3df62baf32f7n) >> 128n;
+  if ((absTick & 32768) !== 0) ratio = (ratio * 0x31be135f97d08fd981231505542fcfa6n) >> 128n;
+  if ((absTick & 65536) !== 0) ratio = (ratio * 0x9aa508b5b7a84e1c677de54f3e99bc9n) >> 128n;
+  if ((absTick & 131072) !== 0) ratio = (ratio * 0x5d6af8dedb81196699c329225ee604n) >> 128n;
+  if ((absTick & 262144) !== 0) ratio = (ratio * 0x2216e584f5fa1ea926041bedfe98n) >> 128n;
+  if ((absTick & 524288) !== 0) ratio = (ratio * 0x48a170391f7dc42444e8fa2n) >> 128n;
+
+  if (tick > 0) ratio = (2n ** 256n - 1n) / ratio;
+
+  return ratio >> 32n;
 }
 
 async function safeSimulateCollect(
@@ -784,6 +1040,85 @@ async function fetchWalletNftTokenIds(owner: Address, contractAddress: Address):
   }
 
   return [...collected];
+}
+
+type BlockscoutNftTransferItem = {
+  timestamp: string;
+  from: { hash: string };
+  to: { hash: string };
+  method?: string | null;
+};
+
+const nftCreatedAtCache = new Map<string, Promise<string | null>>();
+
+async function fetchNftCreatedAt(contractAddress: Address, tokenId: bigint): Promise<string | null> {
+  const cacheKey = `${contractAddress.toLowerCase()}:${tokenId.toString()}`;
+  const cached = nftCreatedAtCache.get(cacheKey);
+  if (cached) return cached;
+
+  const promise = (async () => {
+    let pageParams: BlockscoutV2PageParams | null = null;
+    let earliest: string | null = null;
+
+    try {
+      for (let page = 0; page < 50 && (page === 0 || pageParams); page++) {
+        const url = new URL(
+          `${BLOCKSCOUT_API_BASE}/v2/tokens/${contractAddress.toLowerCase()}/instances/${tokenId.toString()}/transfers`,
+        );
+        for (const [key, value] of Object.entries(pageParams ?? {})) {
+          if (value !== null && value !== '') url.searchParams.set(key, String(value));
+        }
+
+        const data = await fetchJson<BlockscoutV2ListResponse<BlockscoutNftTransferItem>>(
+          url.toString(),
+        );
+
+        for (const item of data.items) {
+          const from = (item.from?.hash ?? '').toLowerCase();
+          if (from === ZERO_ADDRESS) return item.timestamp;
+          if (!earliest || item.timestamp < earliest) earliest = item.timestamp;
+        }
+
+        pageParams = data.next_page_params;
+      }
+    } catch {
+      return null;
+    }
+
+    return earliest;
+  })();
+
+  nftCreatedAtCache.set(cacheKey, promise);
+  return promise;
+}
+
+const v2CreatedAtCache = new Map<string, Promise<string | null>>();
+
+async function fetchV2PairCreatedAt(pairAddress: Address): Promise<string | null> {
+  const cacheKey = pairAddress.toLowerCase();
+  const cached = v2CreatedAtCache.get(cacheKey);
+  if (cached) return cached;
+
+  const promise = (async () => {
+    try {
+      const address = await fetchJson<{ creation_transaction_hash?: string | null }>(
+        `${BLOCKSCOUT_API_BASE}/v2/addresses/${pairAddress.toLowerCase()}`,
+      );
+
+      const creationTx = address.creation_transaction_hash;
+      if (!creationTx) return null;
+
+      const tx = await fetchJson<{ timestamp?: string | null }>(
+        `${BLOCKSCOUT_API_BASE}/v2/transactions/${creationTx}`,
+      );
+      return tx.timestamp ?? null;
+    } catch {
+      return null;
+    }
+  })();
+
+  v2CreatedAtCache.set(cacheKey, promise);
+  return promise;
 }
 
 async function getTokenMetadata(address: Address): Promise<TokenMetadata> {
