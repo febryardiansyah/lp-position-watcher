@@ -30,13 +30,12 @@ Edit `.env`:
 | Variable | Description | Default |
 | --- | --- | --- |
 | `RH_CHAIN_ID` | Robinhood Chain chain ID | `4663` |
-| `RH_RPC_URL` | Primary RPC endpoint | `https://rpc.mainnet.chain.robinhood.com` |
-| `RH_RPC_FALLBACK_URLS` | Comma-separated backup RPCs (e.g. Alchemy/Chainstack) | empty |
+| `RH_RPC_URL` | RPC endpoint (free public RPC) | `https://robinhood-rpc.publicnode.com` |
 | `RH_DATA_DIR` | Directory for tracking snapshots | `data` |
 | `RH_MAX_SNAPSHOTS` | Max snapshots kept per wallet | `200` |
 | `WALLET_ADDRESS` | Optional default wallet address | empty |
 
-> The default public RPC can be unstable/rate-limited. For reliable use, set `RH_RPC_URL` to a private endpoint (e.g. Chainstack or Alchemy) and add fallbacks.
+> All data sources are free (Robinhood Chain public RPCs + Blockscout explorer API). No API keys are required. The RPC client automatically falls back to other free public endpoints if `RH_RPC_URL` is unreachable.
 
 ## Usage
 

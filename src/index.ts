@@ -19,9 +19,8 @@ function rpcHints(errorMessage: string): string[] {
 
   if (lower.includes('certificate') || lower.includes('ssl') || lower.includes('fetch failed')) {
     hints.push(
-      'Primary RPC endpoint has TLS/certificate issues from this network. Use an alternate provider URL in RH_RPC_URL.',
+      'The RPC endpoint is unreachable from this network. Point RH_RPC_URL at another RPC endpoint in .env.',
     );
-    hints.push('Set RH_RPC_FALLBACK_URLS with one or more comma-separated backup RPC endpoints.');
   }
 
   return hints;
