@@ -12,6 +12,8 @@ A CLI tool that reads a wallet's Uniswap LP positions (v2 / v3 / v4) on Robinhoo
 - **USD valuation** — token prices from DexScreener (highest-liquidity Robinhood Chain pool), falling back to Blockscout `exchange_rate`, with pool-ratio fallback when a price is missing
 - **Tracking** — snapshot wallet state locally and diff it over time (opened / closed / modified positions, tick moves, fee accrual)
 - **JSON output** — `--json` flag for raw data when you need machine-readable output
+- **Pagination** — empty/closed positions are paginated (`--limit`, `--page`) to keep output focused
+- **Local caches** — position age is cached to `data/cache/nft-age.json`, so repeat runs skip Blockscout lookups
 
 ## Requirements
 
@@ -40,7 +42,7 @@ Edit `.env`:
 ## Usage
 
 ```bash
-npm run dev -- <walletAddress>            Show LP portfolio
+npm run dev -- <walletAddress>            Show LP portfolio (like lpagent.io)
 npm run dev -- positions <walletAddress>  Same as above
 npm run dev -- positions --json <wallet>  Show raw JSON position data
 npm run dev -- track <walletAddress>      Record a valuation snapshot and report changes since last one
@@ -48,6 +50,18 @@ npm run dev -- history <walletAddress>    List recorded snapshots for a wallet
 npm run dev -- diff <walletAddress>       Diff the two most recent snapshots
 npm run dev -- help                       Show help
 ```
+
+### Pagination
+
+Wallets with many empty/closed positions are paginated (like lpagent.io):
+
+```bash
+npm run dev -- <wallet>                # open positions + first 15 closed
+npm run dev -- <wallet> --limit 30     # 30 closed positions per page
+npm run dev -- <wallet> --page 2       # second page of closed positions
+```
+
+Open positions are always shown in full; only the empty/closed table is paginated.
 
 If `WALLET_ADDRESS` is set in `.env`, the address argument can be omitted.
 

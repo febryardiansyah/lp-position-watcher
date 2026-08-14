@@ -3,6 +3,7 @@ import { z } from 'zod';
 
 import { ROBINHOOD_CHAIN, UNISWAP_CONTRACTS } from '../constants/chain.js';
 import { fetchJson } from '../lib/http.js';
+import { loadNftAgeCache, saveNftAgeCache } from '../lib/storage.js';
 import { publicClient } from '../lib/public-client.js';
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
@@ -427,6 +428,8 @@ export async function getWalletUniswapPositions(input: unknown): Promise<WalletL
 
   const positions: AnyPosition[] = [...v2Positions, ...v3Positions, ...v4Positions];
 
+  flushNftAgeCache();
+
   return {
     wallet: owner,
     chainId: query.chainId,
@@ -616,7 +619,6 @@ async function readV3Positions(owner: Address): Promise<V3Position[]> {
     const token0Meta = await getTokenMetadata(position.token0Address);
     const token1Meta = await getTokenMetadata(position.token1Address);
     const createdAt = await fetchNftCreatedAt(positionManager, position.tokenId);
-
     const simulatedCollect = await safeSimulateCollect(positionManager, owner, position.tokenId);
     const simulatedDecrease =
       position.positionLiquidity === 0n
@@ -754,7 +756,7 @@ async function readV4Positions(owner: Address): Promise<V4Position[]> {
         args: [item.poolId, item.tickLower, item.tickUpper],
       })),
     ),
-    mapInBatches(ownedTokenIds, 16, (tokenId) => fetchNftCreatedAt(positionManager, tokenId)),
+    mapInBatches(ownedTokenIds, 40, (tokenId) => fetchNftCreatedAt(positionManager, tokenId)),
   ]);
 
   const tokenAddresses = valid.flatMap((item) => [item.poolKey.currency0, item.poolKey.currency1]);
@@ -1137,11 +1139,27 @@ type BlockscoutNftTransferItem = {
 };
 
 const nftCreatedAtCache = new Map<string, Promise<string | null>>();
+const nftAgeDiskCache = loadNftAgeCache();
+let nftAgeCacheDirty = false;
+
+function flushNftAgeCache(): void {
+  if (nftAgeCacheDirty) {
+    saveNftAgeCache(nftAgeDiskCache);
+    nftAgeCacheDirty = false;
+  }
+}
 
 async function fetchNftCreatedAt(contractAddress: Address, tokenId: bigint): Promise<string | null> {
   const cacheKey = `${contractAddress.toLowerCase()}:${tokenId.toString()}`;
   const cached = nftCreatedAtCache.get(cacheKey);
   if (cached) return cached;
+
+  const diskCached = nftAgeDiskCache[cacheKey];
+  if (diskCached) {
+    const promise = Promise.resolve(diskCached);
+    nftCreatedAtCache.set(cacheKey, promise);
+    return promise;
+  }
 
   const promise = (async () => {
     let pageParams: BlockscoutV2PageParams | null = null;
@@ -1162,7 +1180,12 @@ async function fetchNftCreatedAt(contractAddress: Address, tokenId: bigint): Pro
 
         for (const item of data.items) {
           const from = (item.from?.hash ?? '').toLowerCase();
-          if (from === ZERO_ADDRESS) return item.timestamp;
+          if (from === ZERO_ADDRESS) {
+            const result = item.timestamp;
+            nftAgeDiskCache[cacheKey] = result;
+            nftAgeCacheDirty = true;
+            return result;
+          }
           if (!earliest || item.timestamp < earliest) earliest = item.timestamp;
         }
 
@@ -1172,6 +1195,10 @@ async function fetchNftCreatedAt(contractAddress: Address, tokenId: bigint): Pro
       return null;
     }
 
+    if (earliest) {
+      nftAgeDiskCache[cacheKey] = earliest;
+      nftAgeCacheDirty = true;
+    }
     return earliest;
   })();
 

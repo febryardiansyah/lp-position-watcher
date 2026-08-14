@@ -35,6 +35,10 @@ const USAGE = `Usage:
   npm run dev -- diff <walletAddress>       Diff the two most recent snapshots
   npm run dev -- help                       Show this help
 
+Pagination options (portfolio view):
+  --limit <n>   Max closed positions per page (default 15)
+  --page <n>    Page of closed positions to show (default 1)
+
 The wallet can also be set with WALLET_ADDRESS in .env.`;
 
 function resolveWallet(walletArg: string | undefined): string {
@@ -58,6 +62,14 @@ async function main() {
   const jsonIndex = args.indexOf('--json');
   const jsonOutput = jsonIndex !== -1;
   if (jsonOutput) args.splice(jsonIndex, 1);
+
+  const limitIndex = args.indexOf('--limit');
+  const limit = limitIndex !== -1 && args[limitIndex + 1] ? Number(args[limitIndex + 1]) : undefined;
+  if (limitIndex !== -1) args.splice(limitIndex, 2);
+
+  const pageIndex = args.indexOf('--page');
+  const page = pageIndex !== -1 && args[pageIndex + 1] ? Number(args[pageIndex + 1]) : undefined;
+  if (pageIndex !== -1) args.splice(pageIndex, 2);
 
   const first = args[0];
 
@@ -88,7 +100,7 @@ async function main() {
       }
 
       const valuation = await valuePositions(read.positions);
-      console.log(renderPortfolio(read, valuation));
+      console.log(renderPortfolio(read, valuation, { limit, page }));
       return;
     }
 
