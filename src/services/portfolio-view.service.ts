@@ -13,11 +13,27 @@ type PortfolioRow = {
   range: string;
 };
 
-export function renderPortfolio(read: WalletLpReadResult, valuation: WalletValuation): string {
+export type PortfolioViewOptions = {
+  limit?: number;
+  page?: number;
+};
+
+const DEFAULT_PAGE_LIMIT = 15;
+
+export function renderPortfolio(
+  read: WalletLpReadResult,
+  valuation: WalletValuation,
+  options: PortfolioViewOptions = {},
+): string {
   const lines: string[] = [];
 
   const open = read.positions.filter((position) => positionOpen(position));
   const closed = read.positions.filter((position) => !positionOpen(position));
+
+  const limit = options.limit ?? DEFAULT_PAGE_LIMIT;
+  const page = Math.max(options.page ?? 1, 1);
+  const closedOffset = (page - 1) * limit;
+  const closedPage = closed.slice(closedOffset, closedOffset + limit);
 
   const inRangeCount = read.positions.filter(
     (position) => position.protocol !== 'v2' && position.inRange === true,
@@ -42,8 +58,17 @@ export function renderPortfolio(read: WalletLpReadResult, valuation: WalletValua
     lines.push(renderTable('Open positions', open, valuation));
   }
 
-  if (closed.length > 0) {
-    lines.push(renderTable('Empty/closed positions', closed, valuation));
+  if (closedPage.length > 0) {
+    lines.push(renderTable('Empty/closed positions', closedPage, valuation));
+
+    if (closed.length > limit) {
+      const from = closedOffset + 1;
+      const to = closedOffset + closedPage.length;
+      lines.push('');
+      lines.push(
+        `Showing closed positions ${from}-${to} of ${closed.length}. Use --page <n> --limit <n> to page through them.`,
+      );
+    }
   }
 
   lines.push('');

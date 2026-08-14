@@ -91,3 +91,28 @@ export function latestSnapshot(wallet: Address): PositionSnapshot | null {
 export function listSnapshots(wallet: Address): PositionSnapshot[] {
   return loadSnapshotStore(wallet).snapshots;
 }
+
+type NftAgeCache = Record<string, string>;
+
+function nftAgeCacheFilePath(): string {
+  return join(env.RH_DATA_DIR, 'cache', 'nft-age.json');
+}
+
+export function loadNftAgeCache(): NftAgeCache {
+  const filePath = nftAgeCacheFilePath();
+
+  if (!existsSync(filePath)) return {};
+
+  try {
+    const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as NftAgeCache;
+    return typeof parsed === 'object' && parsed !== null ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+export function saveNftAgeCache(cache: NftAgeCache): void {
+  const filePath = nftAgeCacheFilePath();
+  mkdirSync(dirname(filePath), { recursive: true });
+  writeFileSync(filePath, `${JSON.stringify(cache)}\n`, 'utf8');
+}
