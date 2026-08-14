@@ -2,16 +2,10 @@ import { createPublicClient, fallback, http } from 'viem';
 
 import { env } from '../config/env.js';
 
-function parseFallbackUrls(raw: string | undefined): string[] {
-  if (!raw) return [];
-
-  return raw
-    .split(',')
-    .map((value) => value.trim())
-    .filter((value) => value.length > 0);
-}
-
-const fallbackUrls = parseFallbackUrls(env.RH_RPC_FALLBACK_URLS);
+const FREE_PUBLIC_RPCS = [
+  'https://robinhood-rpc.publicnode.com',
+  'https://rpc.mainnet.chain.robinhood.com',
+] as const;
 
 function makeTransport(url: string) {
   return http(url, {
@@ -21,9 +15,15 @@ function makeTransport(url: string) {
   });
 }
 
-const transports = [makeTransport(env.RH_RPC_URL), ...fallbackUrls.map((url) => makeTransport(url))];
+function transports(): ReturnType<typeof makeTransport>[] {
+  const primary = makeTransport(env.RH_RPC_URL);
+  const backups = FREE_PUBLIC_RPCS.filter((url) => url !== env.RH_RPC_URL).map((url) =>
+    makeTransport(url),
+  );
+
+  return [primary, ...backups];
+}
 
 export const publicClient = createPublicClient({
-  transport:
-    transports.length === 1 ? transports[0] : fallback(transports, { rank: false }),
+  transport: fallback(transports(), { rank: false }),
 });

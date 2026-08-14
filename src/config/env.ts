@@ -4,7 +4,6 @@ const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   RH_CHAIN_ID: z.coerce.number().int().positive().default(4663),
   RH_RPC_URL: z.url().default('https://rpc.mainnet.chain.robinhood.com'),
-  RH_RPC_FALLBACK_URLS: z.string().optional(),
   RH_DATA_DIR: z.string().default('data'),
   RH_MAX_SNAPSHOTS: z.coerce.number().int().positive().default(200),
   WALLET_ADDRESS: z
