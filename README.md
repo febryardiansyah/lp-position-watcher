@@ -9,7 +9,7 @@ A CLI tool that reads a wallet's Uniswap LP positions (v2 / v3 / v4) on Robinhoo
   - **v2** — LP ERC-20s held by the wallet, verified against the Uniswap v2 factory
   - **v3** — NFTs via `balanceOf` / `tokenOfOwnerByIndex`; principal and uncollected fees via static simulation (`collect` / `decreaseLiquidity`)
   - **v4** — NFTs discovered from Blockscout transfer history; amounts, in-range status and uncollected fees read from the on-chain `StateView` contract (slot0, position info, fee growth)
-- **USD valuation** — token prices from Blockscout (`exchange_rate`, chain coin price), with pool-ratio fallback when a price is missing
+- **USD valuation** — token prices from DexScreener (highest-liquidity Robinhood Chain pool), falling back to Blockscout `exchange_rate`, with pool-ratio fallback when a price is missing
 - **Tracking** — snapshot wallet state locally and diff it over time (opened / closed / modified positions, tick moves, fee accrual)
 - **JSON output** — `--json` flag for raw data when you need machine-readable output
 
@@ -112,8 +112,9 @@ src/
 ### Data sources
 
 - **RPC** — on-chain contract calls (Uniswap v2/v3/v4 contracts, v4 `StateView`)
-- **Blockscout** (`robinhoodchain.blockscout.com`) — wallet token holdings, NFT transfer history (position age), token prices, chain coin price
-- Prices for non-ETH tokens come from Blockscout `exchange_rate`; when unavailable, the pool price ratio is used with whichever side has a known USD price
+- **Blockscout** (`robinhoodchain.blockscout.com`) — wallet token holdings, NFT transfer history (position age), chain coin price, token `exchange_rate` fallback
+- **DexScreener** (`api.dexscreener.com`) — market USD prices, taken from the highest-liquidity Robinhood Chain pool per token (free, no API key)
+- Price resolution order: DexScreener market price → Blockscout `exchange_rate` → pool spot ratio (last resort)
 
 ### Notes
 

@@ -454,50 +454,50 @@ async function readV2Positions(owner: Address): Promise<V2Position[]> {
   const tokens = await fetchWalletTokenList(owner);
   const v2Factory = (UNISWAP_CONTRACTS.v2Factory as Address).toLowerCase();
 
-  const candidates = tokens.filter((token) => token.type === 'ERC-20' && parseBigInt(token.balance) > 0n);
+  const candidates = tokens
+    .filter((token) => token.type === 'ERC-20' && parseBigInt(token.balance) > 0n)
+    .map((token) => ({ token, pairAddress: safeAddress(token.contractAddress) }))
+    .filter((item): item is { token: (typeof tokens)[number]; pairAddress: Address } =>
+      item.pairAddress !== null && parseBigInt(item.token.balance) > 0n,
+    );
 
-  const positions = await mapInBatches(candidates, 20, async (token) => {
-    const pairAddress = safeAddress(token.contractAddress);
-    if (!pairAddress) return null;
+  if (candidates.length === 0) return [];
 
-    const lpBalance = parseBigInt(token.balance);
-    if (lpBalance === 0n) return null;
+  const pairCalls = candidates.flatMap(({ pairAddress }) => [
+    { address: pairAddress, abi: v2PairAbi, functionName: 'factory' },
+    { address: pairAddress, abi: v2PairAbi, functionName: 'token0' },
+    { address: pairAddress, abi: v2PairAbi, functionName: 'token1' },
+    { address: pairAddress, abi: v2PairAbi, functionName: 'getReserves' },
+    { address: pairAddress, abi: v2PairAbi, functionName: 'totalSupply' },
+  ] as MulticallCall[]);
 
-    let factoryAddress: string;
-    let token0Raw: string;
-    let token1Raw: string;
-    let reserves: readonly [bigint, bigint, number];
-    let totalSupply: bigint;
+  const pairResults = await multicallReads<unknown>(pairCalls);
 
-    try {
-      [factoryAddress, token0Raw, token1Raw, reserves, totalSupply] = await Promise.all([
-        publicClient.readContract({
-          address: pairAddress,
-          abi: v2PairAbi,
-          functionName: 'factory',
-        }),
-        publicClient.readContract({
-          address: pairAddress,
-          abi: v2PairAbi,
-          functionName: 'token0',
-        }),
-        publicClient.readContract({
-          address: pairAddress,
-          abi: v2PairAbi,
-          functionName: 'token1',
-        }),
-        publicClient.readContract({
-          address: pairAddress,
-          abi: v2PairAbi,
-          functionName: 'getReserves',
-        }),
-        publicClient.readContract({
-          address: pairAddress,
-          abi: v2PairAbi,
-          functionName: 'totalSupply',
-        }),
-      ]);
-    } catch {
+  const tokenAddresses = candidates.flatMap((_, index) => {
+    const token0 = pairResults[index * 5 + 1];
+    const token1 = pairResults[index * 5 + 2];
+    const result: Address[] = [];
+    if (typeof token0 === 'string') result.push(getAddress(token0));
+    if (typeof token1 === 'string') result.push(getAddress(token1));
+    return result;
+  });
+  await prefetchTokenMetadata(tokenAddresses);
+
+  const positions = await mapInBatches(candidates, 16, async ({ token, pairAddress }, index) => {
+    const offset = index * 5;
+    const factoryAddress = pairResults[offset];
+    const token0Raw = pairResults[offset + 1];
+    const token1Raw = pairResults[offset + 2];
+    const reserves = pairResults[offset + 3];
+    const totalSupply = pairResults[offset + 4];
+
+    if (
+      typeof factoryAddress !== 'string' ||
+      typeof token0Raw !== 'string' ||
+      typeof token1Raw !== 'string' ||
+      !Array.isArray(reserves) ||
+      typeof totalSupply !== 'bigint'
+    ) {
       return null;
     }
 
@@ -506,6 +506,7 @@ async function readV2Positions(owner: Address): Promise<V2Position[]> {
 
     const token0Address = getAddress(token0Raw);
     const token1Address = getAddress(token1Raw);
+    const lpBalance = parseBigInt(token.balance);
 
     const [token0Meta, token1Meta, createdAt] = await Promise.all([
       getTokenMetadata(token0Address),
@@ -549,72 +550,93 @@ async function readV3Positions(owner: Address): Promise<V3Position[]> {
     args: [owner],
   });
 
-  const tokenIds = await Promise.all(
-    Array.from({ length: Number(balance) }, async (_, index) =>
-      publicClient.readContract({
-        address: positionManager,
-        abi: v3NpmAbi,
-        functionName: 'tokenOfOwnerByIndex',
-        args: [owner, BigInt(index)],
-      }),
-    ),
-  );
+  const tokenIds = (await multicallReads<bigint>(
+    Array.from({ length: Number(balance) }, (_, index) => ({
+      address: positionManager,
+      abi: v3NpmAbi,
+      functionName: 'tokenOfOwnerByIndex',
+      args: [owner, BigInt(index)],
+    })),
+  )).filter((id): id is bigint => id !== null);
 
-  const positions = await mapInBatches(tokenIds, 25, async (tokenId) => {
-    const positionData = await publicClient.readContract({
+  if (tokenIds.length === 0) return [];
+
+  const positionDataResults = await multicallReads<readonly [bigint, Address, Address, Address, number, number, number, bigint, bigint, bigint, bigint, bigint]>(
+    tokenIds.map((tokenId) => ({
       address: positionManager,
       abi: v3NpmAbi,
       functionName: 'positions',
       args: [tokenId],
-    });
+    })),
+  );
 
-    const token0Address = getAddress(positionData[2]);
-    const token1Address = getAddress(positionData[3]);
-    const feeTier = Number(positionData[4]);
-    const tickLower = Number(positionData[5]);
-    const tickUpper = Number(positionData[6]);
-    const positionLiquidity = positionData[7];
+  const validPositions = tokenIds
+    .map((tokenId, index) => ({ tokenId, data: positionDataResults[index] }))
+    .filter((item): item is { tokenId: bigint; data: readonly [bigint, Address, Address, Address, number, number, number, bigint, bigint, bigint, bigint, bigint] } => item.data !== null)
+    .map(({ tokenId, data }) => ({
+      tokenId,
+      token0Address: getAddress(data[2]),
+      token1Address: getAddress(data[3]),
+      feeTier: Number(data[4]),
+      tickLower: Number(data[5]),
+      tickUpper: Number(data[6]),
+      positionLiquidity: data[7],
+    }));
 
-    const poolAddress = await publicClient.readContract({
+  const poolAddressResults = await multicallReads<Address>(
+    validPositions.map((position) => ({
       address: v3Factory,
       abi: v3FactoryAbi,
       functionName: 'getPool',
-      args: [token0Address, token1Address, feeTier],
-    });
+      args: [position.token0Address, position.token1Address, position.feeTier],
+    })),
+  );
 
-    if (poolAddress === ZERO_ADDRESS) return null;
+  const withPools = validPositions
+    .map((position, index) => ({ position, poolAddress: poolAddressResults[index] }))
+    .filter((item): item is { position: (typeof validPositions)[number]; poolAddress: Address } =>
+      item.poolAddress !== null && item.poolAddress.toLowerCase() !== ZERO_ADDRESS,
+    );
 
-    const [token0Meta, token1Meta, slot0, createdAt] = await Promise.all([
-      getTokenMetadata(token0Address),
-      getTokenMetadata(token1Address),
-      publicClient.readContract({
-        address: poolAddress,
-        abi: v3PoolAbi,
-        functionName: 'slot0',
-      }),
-      fetchNftCreatedAt(positionManager, tokenId),
-    ]);
+  const slot0Results = await multicallReads<V3Slot0>(
+    withPools.map(({ poolAddress }) => ({
+      address: poolAddress,
+      abi: v3PoolAbi,
+      functionName: 'slot0',
+    })),
+  );
 
-    const simulatedCollect = await safeSimulateCollect(positionManager, owner, tokenId);
+  const tokenAddresses = withPools.flatMap(({ position }) => [position.token0Address, position.token1Address]);
+  await prefetchTokenMetadata(tokenAddresses);
+
+  const positions = await mapInBatches(withPools, 16, async ({ position, poolAddress }, index) => {
+    const slot0 = slot0Results[index];
+    if (!slot0) return null;
+
+    const token0Meta = await getTokenMetadata(position.token0Address);
+    const token1Meta = await getTokenMetadata(position.token1Address);
+    const createdAt = await fetchNftCreatedAt(positionManager, position.tokenId);
+
+    const simulatedCollect = await safeSimulateCollect(positionManager, owner, position.tokenId);
     const simulatedDecrease =
-      positionLiquidity === 0n
+      position.positionLiquidity === 0n
         ? [0n, 0n]
-        : await safeSimulateDecrease(positionManager, owner, tokenId, positionLiquidity);
+        : await safeSimulateDecrease(positionManager, owner, position.tokenId, position.positionLiquidity);
 
     const tickCurrent = Number(slot0[1]);
     const sqrtPriceX96 = slot0[0];
 
     return {
       protocol: 'v3',
-      tokenId: tokenId.toString(),
+      tokenId: position.tokenId.toString(),
       poolAddress: getAddress(poolAddress),
-      feeTier,
-      tickLower,
-      tickUpper,
+      feeTier: position.feeTier,
+      tickLower: position.tickLower,
+      tickUpper: position.tickUpper,
       tickCurrent,
       sqrtPriceX96: sqrtPriceX96.toString(),
-      inRange: tickCurrent >= tickLower && tickCurrent < tickUpper,
-      liquidity: positionLiquidity.toString(),
+      inRange: tickCurrent >= position.tickLower && tickCurrent < position.tickUpper,
+      liquidity: position.positionLiquidity.toString(),
       createdAt,
       token0: {
         ...token0Meta,
@@ -632,6 +654,8 @@ async function readV3Positions(owner: Address): Promise<V3Position[]> {
   return positions.filter((item): item is V3Position => item !== null);
 }
 
+type V3Slot0 = readonly [bigint, number, number, number, number, number, boolean];
+
 async function readV4Positions(owner: Address): Promise<V4Position[]> {
   const positionManager = UNISWAP_CONTRACTS.v4PositionManager as Address;
   const stateView = UNISWAP_CONTRACTS.v4StateView as Address;
@@ -639,143 +663,113 @@ async function readV4Positions(owner: Address): Promise<V4Position[]> {
   const tokenIds = await fetchWalletNftTokenIds(owner, positionManager);
   if (tokenIds.length === 0) return [];
 
-  const currentlyOwnedTokenIds = await mapInBatches(tokenIds, 4, async (tokenId) => {
-    try {
-      const ownerNow = await withRetries(() =>
-        publicClient.readContract({
-          address: positionManager,
-          abi: erc721OwnerOfAbi,
-          functionName: 'ownerOf',
-          args: [tokenId],
-        }),
-      );
+  const ownerResults = await multicallReads<Address>(
+    tokenIds.map((tokenId) => ({
+      address: positionManager,
+      abi: erc721OwnerOfAbi,
+      functionName: 'ownerOf',
+      args: [tokenId],
+    })),
+  );
 
-      return ownerNow.toLowerCase() === owner.toLowerCase() ? tokenId : null;
-    } catch {
-      return null;
+  const ownedTokenIds = tokenIds.filter(
+    (tokenId, index) => ownerResults[index]?.toLowerCase() === owner.toLowerCase(),
+  );
+  if (ownedTokenIds.length === 0) return [];
+
+  const poolInfoResults = await multicallReads<
+    readonly [V4PoolKeyResult, bigint]
+  >(
+    ownedTokenIds.map((tokenId) => ({
+      address: positionManager,
+      abi: v4PositionManagerAbi,
+      functionName: 'getPoolAndPositionInfo',
+      args: [tokenId],
+    })),
+  );
+
+  type PreparedV4 = {
+    tokenId: bigint;
+    poolKey: V4PoolKeyResult | null;
+    tickLower: number | null;
+    tickUpper: number | null;
+    hasSubscriber: boolean | null;
+    poolId: `0x${string}` | null;
+    salt: `0x${string}` | null;
+  };
+
+  const prepared: PreparedV4[] = ownedTokenIds.map((tokenId, index) => {
+    const poolAndInfo = poolInfoResults[index];
+    if (!poolAndInfo) {
+      return { tokenId, poolKey: null, tickLower: null, tickUpper: null, hasSubscriber: null, poolId: null, salt: null };
     }
-  });
 
-  const ownedTokenIds = currentlyOwnedTokenIds.filter((id): id is bigint => id !== null);
+    const poolKey = poolAndInfo[0];
+    const decoded = decodeV4Info(poolAndInfo[1]);
 
-  const positions = await mapInBatches(ownedTokenIds, 4, async (tokenId) => {
-    try {
-      const poolAndInfo = await withRetries(() =>
-        publicClient.readContract({
-          address: positionManager,
-          abi: v4PositionManagerAbi,
-          functionName: 'getPoolAndPositionInfo',
-          args: [tokenId],
-        }),
-      );
-
-      const poolKey = poolAndInfo[0];
-      const packedInfo = poolAndInfo[1];
-      const decoded = decodeV4Info(packedInfo);
-
-      const currency0 = getAddress(poolKey.currency0);
-      const currency1 = getAddress(poolKey.currency1);
-
-      const poolId = computeV4PoolId({
+    return {
+      tokenId,
+      poolKey,
+      tickLower: decoded.tickLower,
+      tickUpper: decoded.tickUpper,
+      hasSubscriber: decoded.hasSubscriber,
+      poolId: computeV4PoolId({
         currency0: poolKey.currency0,
         currency1: poolKey.currency1,
         fee: poolKey.fee,
         tickSpacing: poolKey.tickSpacing,
         hooks: poolKey.hooks,
-      });
-      const salt = toBytes32(tokenId);
+      }),
+      salt: toBytes32(tokenId),
+    };
+  });
 
-      const [slot0, posInfo, feeGrowthInside, createdAt] = await Promise.all([
-        withRetries(() =>
-          publicClient.readContract({
-            address: stateView,
-            abi: v4StateViewAbi,
-            functionName: 'getSlot0',
-            args: [poolId],
-          }),
-        ),
-        withRetries(() =>
-          publicClient.readContract({
-            address: stateView,
-            abi: v4StateViewAbi,
-            functionName: 'getPositionInfo',
-            args: [poolId, positionManager, decoded.tickLower, decoded.tickUpper, salt],
-          }),
-        ),
-        withRetries(() =>
-          publicClient.readContract({
-            address: stateView,
-            abi: v4StateViewAbi,
-            functionName: 'getFeeGrowthInside',
-            args: [poolId, decoded.tickLower, decoded.tickUpper],
-          }),
-        ),
-        fetchNftCreatedAt(positionManager, tokenId),
-      ]);
+  const valid = prepared.filter(
+    (item): item is PreparedV4 & { poolKey: V4PoolKeyResult; poolId: `0x${string}`; salt: `0x${string}`; tickLower: number; tickUpper: number } =>
+      item.poolKey !== null && item.poolId !== null && item.salt !== null && item.tickLower !== null && item.tickUpper !== null,
+  );
 
-      const liquidity = posInfo[0];
-      const tickCurrent = Number(slot0[1]);
-      const sqrtPriceX96 = slot0[0];
-      const inRange = tickCurrent >= decoded.tickLower && tickCurrent < decoded.tickUpper;
+  const [slot0Results, posInfoResults, feeGrowthResults, createdAts] = await Promise.all([
+    multicallReads<V4Slot0>(
+      valid.map((item) => ({
+        address: stateView,
+        abi: v4StateViewAbi,
+        functionName: 'getSlot0',
+        args: [item.poolId],
+      })),
+    ),
+    multicallReads<V4PositionInfo>(
+      valid.map((item) => ({
+        address: stateView,
+        abi: v4StateViewAbi,
+        functionName: 'getPositionInfo',
+        args: [item.poolId, positionManager, item.tickLower, item.tickUpper, item.salt],
+      })),
+    ),
+    multicallReads<V4FeeGrowthInside>(
+      valid.map((item) => ({
+        address: stateView,
+        abi: v4StateViewAbi,
+        functionName: 'getFeeGrowthInside',
+        args: [item.poolId, item.tickLower, item.tickUpper],
+      })),
+    ),
+    mapInBatches(ownedTokenIds, 16, (tokenId) => fetchNftCreatedAt(positionManager, tokenId)),
+  ]);
 
-      const uncollectedFees0 = calculateUncollectedFees(
-        feeGrowthInside[0],
-        posInfo[1],
-        liquidity,
-      );
-      const uncollectedFees1 = calculateUncollectedFees(
-        feeGrowthInside[1],
-        posInfo[2],
-        liquidity,
-      );
+  const tokenAddresses = valid.flatMap((item) => [item.poolKey.currency0, item.poolKey.currency1]);
+  await prefetchTokenMetadata(tokenAddresses);
 
-      const [amount0, amount1] = liquidityAmounts(
-        sqrtPriceX96,
-        decoded.tickLower,
-        decoded.tickUpper,
-        tickCurrent,
-        liquidity,
-      );
+  const validPositions = await mapInBatches(valid, 16, async (item, index) => {
+    const slot0 = slot0Results[index];
+    const posInfo = posInfoResults[index];
+    const feeGrowthInside = feeGrowthResults[index];
+    const createdAt = createdAts[index];
 
-      const [token0Meta, token1Meta] = await Promise.all([
-        getTokenMetadata(currency0),
-        getTokenMetadata(currency1),
-      ]);
-
+    if (!slot0 || !posInfo || !feeGrowthInside) {
       return {
         protocol: 'v4',
-        tokenId: tokenId.toString(),
-        liquidity: liquidity.toString(),
-        tickLower: decoded.tickLower,
-        tickUpper: decoded.tickUpper,
-        tickCurrent,
-        sqrtPriceX96: sqrtPriceX96.toString(),
-        inRange,
-        lpFee: Number(slot0[3]),
-        hasSubscriber: decoded.hasSubscriber,
-        createdAt,
-        poolKey: {
-          currency0,
-          currency1,
-          fee: Number(poolKey.fee),
-          tickSpacing: Number(poolKey.tickSpacing),
-          hooks: getAddress(poolKey.hooks),
-        },
-        token0: {
-          ...token0Meta,
-          principal: formatUnits(amount0, token0Meta.decimals),
-          uncollectedFees: formatUnits(uncollectedFees0, token0Meta.decimals),
-        },
-        token1: {
-          ...token1Meta,
-          principal: formatUnits(amount1, token1Meta.decimals),
-          uncollectedFees: formatUnits(uncollectedFees1, token1Meta.decimals),
-        },
-      } satisfies V4Position;
-    } catch (error) {
-      return {
-        protocol: 'v4',
-        tokenId: tokenId.toString(),
+        tokenId: item.tokenId.toString(),
         liquidity: null,
         tickLower: null,
         tickUpper: null,
@@ -788,13 +782,106 @@ async function readV4Positions(owner: Address): Promise<V4Position[]> {
         poolKey: null,
         token0: null,
         token1: null,
-        readError: error instanceof Error ? error.message : String(error),
+        readError: 'StateView read failed',
       } satisfies V4Position;
     }
+
+    const liquidity = posInfo[0];
+    const tickCurrent = Number(slot0[1]);
+    const sqrtPriceX96 = slot0[0];
+    const inRange = tickCurrent >= item.tickLower && tickCurrent < item.tickUpper;
+
+    const uncollectedFees0 = calculateUncollectedFees(
+      feeGrowthInside[0],
+      posInfo[1],
+      liquidity,
+    );
+    const uncollectedFees1 = calculateUncollectedFees(
+      feeGrowthInside[1],
+      posInfo[2],
+      liquidity,
+    );
+
+    const [amount0, amount1] = liquidityAmounts(
+      sqrtPriceX96,
+      item.tickLower,
+      item.tickUpper,
+      tickCurrent,
+      liquidity,
+    );
+
+    const token0Meta = await getTokenMetadata(item.poolKey.currency0);
+    const token1Meta = await getTokenMetadata(item.poolKey.currency1);
+
+    return {
+      protocol: 'v4',
+      tokenId: item.tokenId.toString(),
+      liquidity: liquidity.toString(),
+      tickLower: item.tickLower,
+      tickUpper: item.tickUpper,
+      tickCurrent,
+      sqrtPriceX96: sqrtPriceX96.toString(),
+      inRange,
+      lpFee: Number(slot0[3]),
+      hasSubscriber: item.hasSubscriber,
+      createdAt,
+      poolKey: {
+        currency0: getAddress(item.poolKey.currency0),
+        currency1: getAddress(item.poolKey.currency1),
+        fee: Number(item.poolKey.fee),
+        tickSpacing: Number(item.poolKey.tickSpacing),
+        hooks: getAddress(item.poolKey.hooks),
+      },
+      token0: {
+        ...token0Meta,
+        principal: formatUnits(amount0, token0Meta.decimals),
+        uncollectedFees: formatUnits(uncollectedFees0, token0Meta.decimals),
+      },
+      token1: {
+        ...token1Meta,
+        principal: formatUnits(amount1, token1Meta.decimals),
+        uncollectedFees: formatUnits(uncollectedFees1, token1Meta.decimals),
+      },
+    } satisfies V4Position;
   });
 
-  return positions;
+  const validByTokenId = new Map(validPositions.map((position) => [position.tokenId, position]));
+
+  return prepared.map((item) => {
+    const position = validByTokenId.get(item.tokenId.toString());
+    if (position) return position;
+
+    return {
+      protocol: 'v4',
+      tokenId: item.tokenId.toString(),
+      liquidity: null,
+      tickLower: null,
+      tickUpper: null,
+      tickCurrent: null,
+      sqrtPriceX96: null,
+      inRange: null,
+      lpFee: null,
+      hasSubscriber: null,
+      createdAt: null,
+      poolKey: null,
+      token0: null,
+      token1: null,
+      readError: 'position read failed',
+    } satisfies V4Position;
+  });
 }
+
+type V4PoolKeyResult = {
+  currency0: Address;
+  currency1: Address;
+  fee: number;
+  tickSpacing: number;
+  hooks: Address;
+};
+
+type V4Slot0 = readonly [bigint, number, number, number];
+type V4PositionInfo = readonly [bigint, bigint, bigint];
+type V4FeeGrowthInside = readonly [bigint, bigint];
 
 function computeV4PoolId(poolKey: {
   currency0: Address;
@@ -1231,17 +1318,82 @@ function safeAddress(value: string): Address | null {
 async function mapInBatches<T, R>(
   items: readonly T[],
   batchSize: number,
-  fn: (item: T) => Promise<R>,
+  fn: (item: T, index: number) => Promise<R>,
 ): Promise<R[]> {
   const result: R[] = [];
 
   for (let i = 0; i < items.length; i += batchSize) {
     const batch = items.slice(i, i + batchSize);
-    const batchResult = await Promise.all(batch.map((item) => fn(item)));
+    const batchResult = await Promise.all(batch.map((item, offset) => fn(item, i + offset)));
     result.push(...batchResult);
   }
 
   return result;
+}
+
+type MulticallCall = {
+  address: Address;
+  abi: readonly unknown[];
+  functionName: string;
+  args?: readonly unknown[];
+};
+
+type MulticallResult<T> = {
+  status: 'success' | 'failure';
+  result?: T;
+  error?: Error;
+};
+
+const MULTICALL_BATCH_SIZE = 64;
+
+async function multicallReads<T>(calls: MulticallCall[]): Promise<(T | null)[]> {
+  const results: (T | null)[] = [];
+
+  for (let i = 0; i < calls.length; i += MULTICALL_BATCH_SIZE) {
+    const chunk = calls.slice(i, i + MULTICALL_BATCH_SIZE);
+
+    const batch = (await withRetries(() =>
+      publicClient.multicall({
+        contracts: chunk as never,
+        allowFailure: true,
+      }),
+    )) as unknown as MulticallResult<T>[];
+
+    for (const item of batch) {
+      results.push(item.status === 'success' && item.result !== undefined ? item.result : null);
+    }
+  }
+
+  return results;
+}
+
+async function prefetchTokenMetadata(addresses: readonly Address[]): Promise<void> {
+  const unique = [...new Set(addresses.map((address) => getAddress(address).toLowerCase() as Address))];
+  const missing = unique.filter((address) => !tokenMetadataCache.has(address));
+  if (missing.length === 0) return;
+
+  const calls: MulticallCall[] = [];
+  for (const address of missing) {
+    calls.push({ address, abi: erc20MetadataAbi, functionName: 'symbol' });
+    calls.push({ address, abi: erc20MetadataAbi, functionName: 'decimals' });
+  }
+
+  const results = await multicallReads<string | number>(calls);
+
+  for (let i = 0; i < missing.length; i++) {
+    const address = missing[i];
+    const symbol = results[i * 2];
+    const decimals = results[i * 2 + 1];
+
+    tokenMetadataCache.set(
+      address,
+      Promise.resolve({
+        address,
+        symbol: typeof symbol === 'string' && symbol.trim().length > 0 ? symbol : `${address.slice(0, 6)}...`,
+        decimals: typeof decimals === 'number' ? decimals : 18,
+      }),
+    );
+  }
 }
 
 function delay(ms: number): Promise<void> {

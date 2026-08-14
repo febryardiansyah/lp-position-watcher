@@ -4,6 +4,7 @@ import { fetchJson } from '../lib/http.js';
 import type { AnyPosition, TokenMetadata } from './lp-position.service.js';
 
 const BLOCKSCOUT_API_BASE = 'https://robinhoodchain.blockscout.com/api';
+const DEXSCREENER_API_BASE = 'https://api.dexscreener.com/latest/dex';
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 const WETH_ADDRESS = '0x0bd7d308f8e1639fab988df18a8011f41eacad73';
 
@@ -15,6 +16,18 @@ type BlockscoutTokenResponse = {
 
 type BlockscoutStatsResponse = {
   coin_price?: string | null;
+};
+
+type DexScreenerPair = {
+  chainId: string;
+  priceUsd: string | null;
+  liquidity?: {
+    usd: number | null;
+  } | null;
+};
+
+type DexScreenerTokenResponse = {
+  pairs?: DexScreenerPair[];
 };
 
 const priceCache = new Map<string, Promise<number | null>>();
@@ -40,6 +53,37 @@ export function getEthUsdPrice(): Promise<number | null> {
   return ethPricePromise;
 }
 
+function getDexScreenerUsdPrice(token: string): Promise<number | null> {
+  const cacheKey = `dexscreener:${token.toLowerCase()}`;
+  const cached = priceCache.get(cacheKey);
+  if (cached) return cached;
+
+  const promise = (async () => {
+    try {
+      const data = await fetchJson<DexScreenerTokenResponse>(
+        `${DEXSCREENER_API_BASE}/tokens/${token.toLowerCase()}`,
+      );
+
+      const robinhoodPairs = (data.pairs ?? [])
+        .filter((pair) => pair.chainId === 'robinhood')
+        .filter((pair) => parsePrice(pair.priceUsd) !== null);
+
+      if (robinhoodPairs.length === 0) return null;
+
+      robinhoodPairs.sort(
+        (a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0),
+      );
+
+      return parsePrice(robinhoodPairs[0].priceUsd);
+    } catch {
+      return null;
+    }
+  })();
+
+  priceCache.set(cacheKey, promise);
+  return promise;
+}
+
 export function getUsdPrice(token: Address): Promise<number | null> {
   const normalized = getAddress(token).toLowerCase();
   const cached = priceCache.get(normalized);
@@ -50,6 +94,9 @@ export function getUsdPrice(token: Address): Promise<number | null> {
       if (isEthToken(normalized)) {
         return await getEthUsdPrice();
       }
+
+      const dexPrice = await getDexScreenerUsdPrice(normalized);
+      if (dexPrice !== null) return dexPrice;
 
       const data = await fetchJson<BlockscoutTokenResponse>(
         `${BLOCKSCOUT_API_BASE}/v2/tokens/${normalized}`,
