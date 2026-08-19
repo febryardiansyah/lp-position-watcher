@@ -9,7 +9,12 @@ import { env } from '../config/env.js';
 import { loadNftAgeCache, saveNftAgeCache } from './storage.js';
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
-const MAX_PAGES = 25; // 25 × 1000 most recent mints (~1-2 weeks of PCS v3 mints)
+const MAX_PAGES = 25; // 25 × 1000 most recent mints
+// Per-NPM marker recording the oldest tokenId covered by a full fetch, so
+// older tokens can be rejected instantly instead of re-paging every run.
+function windowKey(positionManager: string): string {
+  return `${positionManager}:__window_min`;
+}
 
 let archiveClient: PublicClient | null = null;
 
@@ -40,34 +45,57 @@ const mintIndex = new Map<string, Map<string, string>>();
 const inflightIndex = new Map<string, Promise<void>>();
 const unsupported = new Set<string>(); // endpoints without alchemy_getAssetTransfers
 
-async function ensureMintIndex(client: PublicClient, positionManager: Address): Promise<void> {
+type TransfersResponse = {
+  transfers?: Array<{ erc721TokenId?: string; metadata?: { blockTimestamp?: string } }>;
+  pageKey?: string | null;
+};
+
+async function fetchMintPage(
+  client: PublicClient,
+  positionManager: Address,
+  pageKey: string | null,
+): Promise<TransfersResponse> {
+  const params: Record<string, unknown> = {
+    fromBlock: '0x0',
+    toBlock: 'latest',
+    fromAddress: ZERO_ADDRESS, // mints only
+    contractAddresses: [positionManager],
+    category: ['erc721'],
+    order: 'desc',
+    withMetadata: true,
+    maxCount: '0x3e8', // 1000
+  };
+  if (pageKey) params.pageKey = pageKey;
+
+  return (await client.request({
+    method: 'alchemy_getAssetTransfers' as never, // custom Alchemy method not in viem's typings
+    params: [params],
+  })) as TransfersResponse;
+}
+
+async function ensureMintIndex(
+  client: PublicClient,
+  positionManager: Address,
+  wanted: bigint[],
+): Promise<void> {
   const key = positionManager.toLowerCase();
   const existing = inflightIndex.get(key);
   if (existing) return existing;
   if (mintIndex.has(key) || unsupported.has(key)) return;
 
+  // Nothing to resolve — avoid the fetch entirely.
+  if (wanted.length === 0) return;
+
+  const wantedSet = new Set(wanted.map((t) => t.toString()));
+
   const promise = (async () => {
     const index = new Map<string, string>();
+    let pageKey: string | null = null;
+    let windowMin: string | null = null;
+    let fullWindow = false;
     try {
-      let pageKey: string | null = null;
       for (let page = 0; page < MAX_PAGES; page++) {
-        const params: Record<string, unknown> = {
-          fromBlock: '0x0',
-          toBlock: 'latest',
-          fromAddress: ZERO_ADDRESS, // mints only
-          contractAddresses: [positionManager],
-          category: ['erc721'],
-          order: 'desc',
-          withMetadata: true,
-          maxCount: '0x3e8', // 1000
-        };
-        if (pageKey) params.pageKey = pageKey;
-
-        const res = (await client.request({
-          method: 'alchemy_getAssetTransfers' as never, // custom Alchemy method not in viem's typings
-          params: [params],
-        })) as { transfers?: Array<{ erc721TokenId?: string; metadata?: { blockTimestamp?: string } }>; pageKey?: string | null };
-
+        const res = await fetchMintPage(client, positionManager, pageKey);
         const transfers = res.transfers ?? [];
         for (const t of transfers) {
           const tokenId = t.erc721TokenId ? BigInt(t.erc721TokenId).toString() : null;
@@ -79,12 +107,32 @@ async function ensureMintIndex(client: PublicClient, positionManager: Address): 
             ageDiskCache[cacheKey] = ts;
             ageCacheDirty = true;
           }
+          wantedSet.delete(tokenId);
+          if (windowMin === null || BigInt(tokenId) < BigInt(windowMin)) windowMin = tokenId;
         }
 
         pageKey = res.pageKey ?? null;
-        if (!pageKey || transfers.length === 0) break;
+        // Stop early once every requested tokenId has been resolved.
+        if (wantedSet.size === 0) break;
+        if (!pageKey || transfers.length === 0) {
+          fullWindow = true;
+          break;
+        }
+        if (page === MAX_PAGES - 1) fullWindow = true;
       }
+
       mintIndex.set(key, index);
+
+      // Only record the window bound when we covered the whole window (natural
+      // end or page cap) — an early stop after resolving the requested tokens
+      // says nothing about older coverage.
+      if (fullWindow && windowMin !== null) {
+        const wk = windowKey(key);
+        if (ageDiskCache[wk] === undefined || BigInt(windowMin) < BigInt(ageDiskCache[wk])) {
+          ageDiskCache[wk] = windowMin;
+          ageCacheDirty = true;
+        }
+      }
     } catch {
       // Endpoint doesn't support alchemy_getAssetTransfers (or failed) — don't
       // retry every position; mark unsupported for this run.
@@ -122,7 +170,11 @@ export function getBscNftMintTimestamp(
   const client = getArchiveClient();
   if (!client) return Promise.resolve(null);
 
-  return ensureMintIndex(client, positionManager).then(() => {
+  // Known window bound and this token is older than it — no point fetching.
+  const windowMin = ageDiskCache[windowKey(key)];
+  if (windowMin !== undefined && tokenId < BigInt(windowMin)) return Promise.resolve(null);
+
+  return ensureMintIndex(client, positionManager, [tokenId]).then(() => {
     const index = mintIndex.get(key);
     return index?.get(tokenId.toString()) ?? null;
   });
