@@ -7,7 +7,7 @@ const envSchema = z.object({
   RH_DATA_DIR: z.string().default('data'),
   RH_MAX_SNAPSHOTS: z.coerce.number().int().positive().default(200),
   BSC_RPC_URL: z.url().optional(),
-  BSCSCAN_API_KEY: z.string().optional(),
+  BSC_ARCHIVE_RPC_URL: z.url().optional(),
   BSC_CHAIN_ID: z.coerce.number().int().positive().default(56),
   WALLET_ADDRESS: z
     .string()

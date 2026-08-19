@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { BSC_CONFIG, ROBINHOOD_CHAIN, UNISWAP_CONTRACTS, type ChainName } from '../constants/chain.js';
 import { env } from '../config/env.js';
 import { publicClientBsc } from '../lib/bsc-public-client.js';
-import { getNftTransferHistory } from '../lib/bscscan.js';
+import { flushBscNftAgeCache, getBscNftMintTimestamp } from '../lib/bsc-nft-age.js';
 import { fetchJson } from '../lib/http.js';
 import { publicClient } from '../lib/public-client.js';
 import { loadNftAgeCache, saveNftAgeCache } from '../lib/storage.js';
@@ -537,7 +537,7 @@ export async function getWalletUniswapPositions(input: unknown): Promise<WalletL
     ]);
   } else {
     [v3Pancake] = await Promise.all([
-      includeV3 ? readPancakeV3Positions(owner, env.BSCSCAN_API_KEY) : Promise.resolve([]),
+      includeV3 ? readPancakeV3Positions(owner) : Promise.resolve([]),
     ]);
   }
 
@@ -546,6 +546,8 @@ export async function getWalletUniswapPositions(input: unknown): Promise<WalletL
 
   if (query.chain === 'robinhood') {
     flushNftAgeCache();
+  } else {
+    flushBscNftAgeCache();
   }
 
   return {
@@ -580,7 +582,7 @@ export async function getWalletUniswapPositions(input: unknown): Promise<WalletL
             'Positions are discovered from the PancakeSwap v3 NonfungiblePositionManager (balanceOf / tokenOfOwnerByIndex).',
             'Pool state (sqrtPriceX96, current tick) is read from each PancakeV3Pool via slot0.',
             'Principal and uncollected fees are computed via static simulation of decreaseLiquidity / collect on the position manager.',
-            'NFT mint timestamps are fetched from BscScan (set BSCSCAN_API_KEY to lift the 5 req/s free-tier limit).',
+            'NFT mint timestamps are read from an archive BSC RPC (set BSC_ARCHIVE_RPC_URL, e.g. Alchemy BSC, to enable the Age column).',
             'v2 and v4 positions are not read on BSC in this slice.',
           ],
   };
@@ -690,10 +692,7 @@ async function readV3Positions(owner: Address): Promise<V3Position[]> {
   });
 }
 
-async function readPancakeV3Positions(
-  owner: Address,
-  bscscanApiKey?: string,
-): Promise<V3Position[]> {
+async function readPancakeV3Positions(owner: Address): Promise<V3Position[]> {
   const positionManager = BSC_CONFIG.pancake.v3Npm as Address;
   const pancakeV3Factory = BSC_CONFIG.pancake.v3Factory as Address;
 
@@ -704,10 +703,7 @@ async function readPancakeV3Positions(
     factory: pancakeV3Factory,
     npmAbi: pancakeV3NpmAbi,
     provider: 'pancake',
-    fetchCreatedAt: (tokenId) =>
-      getNftTransferHistory(positionManager, tokenId, { apiKey: bscscanApiKey }).then((ts) =>
-        ts ? new Date(Number(ts) * 1000).toISOString() : null,
-      ),
+    fetchCreatedAt: (tokenId) => getBscNftMintTimestamp(positionManager, tokenId),
   });
 }
 

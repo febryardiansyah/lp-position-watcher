@@ -25,7 +25,6 @@ export const BSC_CONFIG = {
     'https://bsc-dataseed.binance.org',
   ],
   multicall3: '0xcA11bde05977b3631167028862bE2a173976CA11',
-  explorerBscscanBase: 'https://api.bscscan.com/api',
   dexscreenerChainId: 'bsc',
   pancake: {
     v3Factory: '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865',

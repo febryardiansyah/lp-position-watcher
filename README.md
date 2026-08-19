@@ -42,10 +42,10 @@ Edit `.env`:
 | `RH_MAX_SNAPSHOTS` | Max snapshots kept per wallet | `200` |
 | `BSC_RPC_URL` | Optional BSC RPC override | (public fallbacks) |
 | `BSC_CHAIN_ID` | BSC chain ID | `56` |
-| `BSCSCAN_API_KEY` | Optional BscScan API key (5 req/s free, 100 req/s with key) | empty |
+| `BSC_ARCHIVE_RPC_URL` | Optional archive-capable BSC RPC (e.g. Alchemy BSC app) for NFT mint-time lookups (position age) | empty |
 | `WALLET_ADDRESS` | Optional default wallet address | empty |
 
-> Robinhood Chain runs use free public RPCs + Blockscout, no API keys required. BSC runs need a public RPC (built-in fallbacks include `bsc-rpc.publicnode.com`, `1rpc.io/bnb`, `bsc-dataseed.binance.org`) and optionally a BscScan API key to lift the 5 req/s limit on NFT history lookups.
+> Robinhood Chain runs use free public RPCs + Blockscout, no API keys required. BSC runs use free public RPCs (built-in fallbacks include `bsc-rpc.publicnode.com`, `1rpc.io/bnb`, `bsc-dataseed.binance.org`). The **Age column on BSC requires `BSC_ARCHIVE_RPC_URL`** (e.g. a free Alchemy BSC app): free public RPCs reject the wide `eth_getLogs` ranges needed to find an NFT's mint log, so without it ages show as "—".
 
 ## Usage
 
@@ -150,7 +150,7 @@ src/
 │   ├── http.ts                    Fetch with retries/backoff
 │   ├── public-client.ts           Viem public client for Robinhood Chain
 │   ├── bsc-public-client.ts       Viem public client for BNB Smart Chain
-│   ├── bscscan.ts                 BscScan API client (NFT transfer history)
+│   ├── bsc-nft-age.ts             BSC NFT mint-time resolver (archive RPC `eth_getLogs`)
 │   └── storage.ts                 Snapshot persistence (JSON files)
 └── services/
     ├── lp-position.service.ts     Position discovery (v2/v3/v4 + PancakeSwap v3) + on-chain reads
@@ -163,7 +163,7 @@ src/
 
 - **RPC** — on-chain contract calls (Uniswap v2/v3/v4 on Robinhood Chain, PancakeSwap v3 on BSC, v4 `StateView`)
 - **Blockscout** (`robinhoodchain.blockscout.com`) — wallet token holdings, NFT transfer history (position age), chain coin price, token `exchange_rate` fallback (Robinhood Chain only)
-- **BscScan** (`api.bscscan.com`) — PancakeSwap v3 NFT transfer history (mint timestamp) (BSC only)
+- **Archive BSC RPC** (`BSC_ARCHIVE_RPC_URL`, e.g. Alchemy) — PancakeSwap v3 NFT mint logs (`Transfer(from=0x0, tokenId)`) for position age (BSC only)
 - **DexScreener** (`api.dexscreener.com`) — market USD prices, taken from the highest-liquidity pool on the active chain per token (free, no API key)
 - Price resolution order: DexScreener market price → Blockscout `exchange_rate` (Robinhood only) → pool spot ratio (last resort)
 
