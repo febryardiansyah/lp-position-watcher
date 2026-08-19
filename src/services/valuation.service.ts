@@ -54,6 +54,7 @@ const CHAIN_CONTEXTS: Record<'robinhood' | 'bsc', ChainContext> = {
 };
 
 const priceCache = new Map<string, Promise<number | null>>();
+const poolPriceCache = new Map<string, Promise<PairUsdPrices>>();
 const ethPricePromiseByChain = new Map<number, Promise<number | null>>();
 
 export function isEthToken(token: string): boolean {
@@ -70,6 +71,26 @@ export function isNativeTokenForChain(token: string, chainId: number): boolean {
   const normalized = getAddress(token).toLowerCase();
   if (chainId === ROBINHOOD_CHAIN.id) return isEthToken(normalized);
   if (chainId === BSC_CONFIG.id) return normalized === ZERO_ADDRESS || isWrappedBnb(normalized);
+  return false;
+}
+
+const STABLECOIN_ADDRESSES_BSC = new Set<string>([
+  '0x55d398326f99059ff775485246999027b3197955', // USDT
+  '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d', // USDC
+  '0xe9e7cea3dedca5984780bafc599bd69add087d56', // BUSD
+  '0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3', // DAI
+  '0x90c97f71e18723b0cf0dfa30ee176ab653e89f40', // FRAX
+  '0x4d15a3a2286d883af0aa1b3f21367843fac63e07', // TUSD
+  '0x14016e85a25aeb130656ee3f5d597cefcc921692', // EUROC
+]);
+
+export function isUsdStablecoin(token: string, chainId: number): boolean {
+  const normalized = getAddress(token).toLowerCase();
+  if (chainId === ROBINHOOD_CHAIN.id) {
+    return normalized === '0x9702230a8ea53601f5cd2dc00fdbc13d4df174a8' // USDC.e on RH
+      || normalized === '0x6dcb1d9b6b4d13683dd3ee10b27ae3d6f4b4c4cd'; // USDC on RH
+  }
+  if (chainId === BSC_CONFIG.id) return STABLECOIN_ADDRESSES_BSC.has(normalized);
   return false;
 }
 
@@ -136,6 +157,75 @@ function getDexScreenerUsdPrice(
   return promise;
 }
 
+type DexScreenerPairDetail = {
+  chainId?: string;
+  priceUsd?: string | null;
+  baseToken?: { address?: string };
+  quoteToken?: { address?: string };
+};
+
+type DexScreenerPairResponse = {
+  pair?: DexScreenerPairDetail | null;
+};
+
+export function getPoolUsdPrices(
+  pairAddress: Address,
+  chainId: number = ROBINHOOD_CHAIN.id,
+  token0: Address,
+  token1: Address,
+): Promise<PairUsdPrices> {
+  const ctx = chainId === BSC_CONFIG.id ? CHAIN_CONTEXTS.bsc : CHAIN_CONTEXTS.robinhood;
+  const cacheKey = `pool:${chainId}:${pairAddress.toLowerCase()}`;
+  const cached = poolPriceCache.get(cacheKey);
+  if (cached) return cached;
+
+  const promise = (async (): Promise<PairUsdPrices> => {
+    try {
+      const data = await fetchJson<DexScreenerPairResponse>(
+        `${DEXSCREENER_API_BASE}/pairs/${ctx.dexscreenerChainId}/${pairAddress.toLowerCase()}`,
+      );
+      const pair = data.pair;
+      if (!pair || pair.chainId !== ctx.dexscreenerChainId) {
+        return { price0: null, price1: null };
+      }
+      const priceUsd = parsePrice(pair.priceUsd ?? null);
+      if (priceUsd === null) {
+        return { price0: null, price1: null };
+      }
+      const baseAddr = (pair.baseToken?.address ?? '').toLowerCase();
+      const quoteAddr = (pair.quoteToken?.address ?? '').toLowerCase();
+      const t0 = token0.toLowerCase();
+      const t1 = token1.toLowerCase();
+      const t0IsStable = isUsdStablecoin(t0, chainId);
+      const t1IsStable = isUsdStablecoin(t1, chainId);
+      const baseIsT0 = baseAddr === t0;
+      const baseIsT1 = baseAddr === t1;
+      const basePricePerUsd = priceUsd;
+      if (t0IsStable && t1IsStable) {
+        return { price0: 1, price1: 1 };
+      }
+      if (t0IsStable && baseIsT1) {
+        return { price0: 1, price1: basePricePerUsd };
+      }
+      if (t1IsStable && baseIsT0) {
+        return { price0: basePricePerUsd, price1: 1 };
+      }
+      if (baseIsT0 && quoteAddr === t1) {
+        return { price0: priceUsd, price1: null };
+      }
+      if (baseIsT1 && quoteAddr === t0) {
+        return { price0: null, price1: priceUsd };
+      }
+      return { price0: null, price1: null };
+    } catch {
+      return { price0: null, price1: null };
+    }
+  })();
+
+  poolPriceCache.set(cacheKey, promise);
+  return promise;
+}
+
 export function getUsdPrice(token: Address, chainId: number = ROBINHOOD_CHAIN.id): Promise<number | null> {
   const ctx = chainId === BSC_CONFIG.id ? CHAIN_CONTEXTS.bsc : CHAIN_CONTEXTS.robinhood;
   const normalized = getAddress(token).toLowerCase();
@@ -147,6 +237,10 @@ export function getUsdPrice(token: Address, chainId: number = ROBINHOOD_CHAIN.id
     try {
       if (isNativeTokenForChain(normalized, chainId)) {
         return await getNativeUsdPrice(chainId);
+      }
+
+      if (isUsdStablecoin(normalized, chainId)) {
+        return 1;
       }
 
       const dexPrice = await getDexScreenerUsdPrice(normalized, ctx.dexscreenerChainId);
@@ -209,8 +303,34 @@ export async function resolvePairPrices(args: {
   decimals1: number;
   pool: PairPoolContext;
   chainId?: number;
+  poolAddress?: Address;
 }): Promise<PairUsdPrices> {
   const chainId = args.chainId ?? ROBINHOOD_CHAIN.id;
+
+  if (args.poolAddress) {
+    const poolPrices = await getPoolUsdPrices(args.poolAddress, chainId, args.token0, args.token1);
+    if (poolPrices.price0 !== null && poolPrices.price1 !== null) {
+      return poolPrices;
+    }
+    const [perToken0, perToken1] = await Promise.all([
+      poolPrices.price0 !== null ? Promise.resolve(poolPrices.price0) : getUsdPrice(args.token0, chainId),
+      poolPrices.price1 !== null ? Promise.resolve(poolPrices.price1) : getUsdPrice(args.token1, chainId),
+    ]);
+    const price0 = perToken0;
+    const price1 = perToken1;
+    if (price0 !== null && price1 !== null) {
+      return { price0, price1 };
+    }
+    const ratio = priceOfToken1InToken0(args.pool, args.decimals0, args.decimals1);
+    if (ratio === null || ratio <= 0) {
+      return { price0, price1 };
+    }
+    return {
+      price0: price0 ?? (price1 !== null ? price1 / ratio : null),
+      price1: price1 ?? (price0 !== null ? price0 * ratio : null),
+    };
+  }
+
   const [price0, price1] = await Promise.all([
     getUsdPrice(args.token0, chainId),
     getUsdPrice(args.token1, chainId),
@@ -296,6 +416,7 @@ export async function valuePosition(
       token0: position.token0,
       token1: position.token1,
       chainId,
+      poolAddress: position.poolAddress,
     });
   }
 
@@ -322,6 +443,7 @@ async function valueConcentrated(args: {
   token0: TokenMetadata & { principal: string; uncollectedFees: string };
   token1: TokenMetadata & { principal: string; uncollectedFees: string };
   chainId?: number;
+  poolAddress?: Address;
 }): Promise<PositionValuation> {
   const chainId = args.chainId ?? ROBINHOOD_CHAIN.id;
   const prices = await resolvePairPrices({
@@ -331,6 +453,7 @@ async function valueConcentrated(args: {
     decimals1: args.token1.decimals,
     pool: { kind: 'v3', sqrtPriceX96: args.sqrtPriceX96 },
     chainId,
+    poolAddress: args.poolAddress,
   });
 
   const principal0 = Number(args.token0.principal);
