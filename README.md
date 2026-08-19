@@ -1,19 +1,24 @@
-# Robinhood Chain Uniswap LP Position CLI
+# Robinhood Chain & BSC LP Position CLI
 
-A CLI tool that reads a wallet's Uniswap LP positions (v2 / v3 / v4) on Robinhood Chain and displays them in a portfolio view — including USD value, in-range status, uncollected fees, position age, and fee tier. It also supports snapshot-based tracking and diffing for PnL-style analysis.
+A CLI tool that reads a wallet's LP positions and displays them in a portfolio view — including USD value, in-range status, uncollected fees, position age, and fee tier. It also supports snapshot-based tracking and diffing for PnL-style analysis.
+
+- **Robinhood Chain** (chain 4663, default): Uniswap v2 / v3 / v4 LP positions.
+- **BNB Smart Chain** (chain 56, opt-in via `--chain bsc`): PancakeSwap v3 LP positions.
 
 ## Features
 
 - **Portfolio view** — total USD value, position counts by protocol, in-range / out-of-range summary, total unclaimed fees, plus a table of open and empty/closed positions (Pool, Value, In range, Unclaimed, Age, Fee, Range)
 - **Protocol support**
-  - **v2** — LP ERC-20s held by the wallet, verified against the Uniswap v2 factory
+  - **v2 (Robinhood Chain)** — LP ERC-20s held by the wallet, verified against the Uniswap v2 factory
   - **v3** — NFTs via `balanceOf` / `tokenOfOwnerByIndex`; principal and uncollected fees via static simulation (`collect` / `decreaseLiquidity`)
-  - **v4** — NFTs discovered from Blockscout transfer history; amounts, in-range status and uncollected fees read from the on-chain `StateView` contract (slot0, position info, fee growth)
-- **USD valuation** — token prices from DexScreener (highest-liquidity Robinhood Chain pool), falling back to Blockscout `exchange_rate`, with pool-ratio fallback when a price is missing
+    - On Robinhood Chain: Uniswap v3
+    - On BSC: PancakeSwap v3
+  - **v4 (Robinhood Chain)** — NFTs discovered from Blockscout transfer history; amounts, in-range status and uncollected fees read from the on-chain `StateView` contract (slot0, position info, fee growth)
+- **USD valuation** — token prices from DexScreener (highest-liquidity pool on the active chain), falling back to Blockscout `exchange_rate` (Robinhood) or pool-ratio fallback
 - **Tracking** — snapshot wallet state locally and diff it over time (opened / closed / modified positions, tick moves, fee accrual)
 - **JSON output** — `--json` flag for raw data when you need machine-readable output
 - **Pagination** — empty/closed positions are paginated (`--limit`, `--page`) to keep output focused
-- **Local caches** — position age is cached to `data/cache/nft-age.json`, so repeat runs skip Blockscout lookups
+- **Local caches** — position age is cached to `data/cache/nft-age.json` (Robinhood) so repeat runs skip Blockscout lookups
 
 ## Requirements
 
@@ -32,12 +37,15 @@ Edit `.env`:
 | Variable | Description | Default |
 | --- | --- | --- |
 | `RH_CHAIN_ID` | Robinhood Chain chain ID | `4663` |
-| `RH_RPC_URL` | RPC endpoint (free public RPC) | `https://robinhood-rpc.publicnode.com` |
+| `RH_RPC_URL` | Robinhood Chain RPC endpoint | `https://robinhood-rpc.publicnode.com` |
 | `RH_DATA_DIR` | Directory for tracking snapshots | `data` |
 | `RH_MAX_SNAPSHOTS` | Max snapshots kept per wallet | `200` |
+| `BSC_RPC_URL` | Optional BSC RPC override | (public fallbacks) |
+| `BSC_CHAIN_ID` | BSC chain ID | `56` |
+| `BSCSCAN_API_KEY` | Optional BscScan API key (5 req/s free, 100 req/s with key) | empty |
 | `WALLET_ADDRESS` | Optional default wallet address | empty |
 
-> All data sources are free (Robinhood Chain public RPCs + Blockscout explorer API). No API keys are required. The RPC client automatically falls back to other free public endpoints if `RH_RPC_URL` is unreachable.
+> Robinhood Chain runs use free public RPCs + Blockscout, no API keys required. BSC runs need a public RPC (built-in fallbacks include `bsc-rpc.publicnode.com`, `1rpc.io/bnb`, `bsc-dataseed.binance.org`) and optionally a BscScan API key to lift the 5 req/s limit on NFT history lookups.
 
 ## Usage
 
@@ -48,8 +56,11 @@ npm run dev -- positions --json <wallet>  Show raw JSON position data
 npm run dev -- track <walletAddress>      Record a valuation snapshot and report changes since last one
 npm run dev -- history <walletAddress>    List recorded snapshots for a wallet
 npm run dev -- diff <walletAddress>       Diff the two most recent snapshots
+npm run dev -- --chain bsc <wallet>       Read PancakeSwap v3 on BNB Smart Chain
 npm run dev -- help                       Show help
 ```
+
+Append `--chain robinhood` (default) or `--chain bsc` to any of the above to switch chains.
 
 ### Pagination
 
@@ -86,6 +97,29 @@ Open positions
 7  USDG/EQUITY   $622,948,152.89  yes       $237,959,682.91 (…) 13h 55m  5.00%  354000 → 360500
 ```
 
+### BSC (PancakeSwap v3) example
+
+```bash
+npm run dev -- --chain bsc 0xYourBscWallet
+```
+
+Output:
+
+```
+Wallet: 0xYourBscWallet
+Chain: BNB Smart Chain (56)
+
+Total Value: $12,345.67
+Positions: 4 (v2: 0, v3: 4, v4: 0)
+Providers: uniswap 0, pancake 4
+In range: 3   Out of range: 1   Unclaimed fees: $5.43
+
+Open positions
+#  Pool                                Value       In range  Unclaimed    Age      Fee     Range
+1  [pancake] CAKE/WBNB                 $9,876.54   yes       1.2 CAKE + … 2d 4h    1.00%   -100 → 200
+2  [pancake] USDT/BUSD                 $1,234.56   no        0.05 USDT …  5d 1h    0.05%   0 → 60
+```
+
 ### Tracking PnL over time
 
 ```bash
@@ -111,24 +145,27 @@ Snapshots are stored as JSON files under `RH_DATA_DIR` (one file per wallet).
 src/
 ├── index.ts                       CLI entry point (arg parsing, command dispatch)
 ├── config/env.ts                  Environment validation (zod)
-├── constants/chain.ts             Chain + Uniswap contract addresses
+├── constants/chain.ts             Chain + contract addresses (RH + BSC)
 ├── lib/
 │   ├── http.ts                    Fetch with retries/backoff
-│   ├── public-client.ts           Viem public client with RPC fallbacks
+│   ├── public-client.ts           Viem public client for Robinhood Chain
+│   ├── bsc-public-client.ts       Viem public client for BNB Smart Chain
+│   ├── bscscan.ts                 BscScan API client (NFT transfer history)
 │   └── storage.ts                 Snapshot persistence (JSON files)
 └── services/
-    ├── lp-position.service.ts     Position discovery (v2/v3/v4) + on-chain reads
-    ├── valuation.service.ts       USD pricing and position/wallet valuation
-    ├── portfolio-view.service.ts  portfolio rendering
+    ├── lp-position.service.ts     Position discovery (v2/v3/v4 + PancakeSwap v3) + on-chain reads
+    ├── valuation.service.ts       USD pricing and position/wallet valuation (chain-aware)
+    ├── portfolio-view.service.ts  Portfolio rendering
     └── tracker.service.ts         Snapshots, diffing, change summaries
 ```
 
 ### Data sources
 
-- **RPC** — on-chain contract calls (Uniswap v2/v3/v4 contracts, v4 `StateView`)
-- **Blockscout** (`robinhoodchain.blockscout.com`) — wallet token holdings, NFT transfer history (position age), chain coin price, token `exchange_rate` fallback
-- **DexScreener** (`api.dexscreener.com`) — market USD prices, taken from the highest-liquidity Robinhood Chain pool per token (free, no API key)
-- Price resolution order: DexScreener market price → Blockscout `exchange_rate` → pool spot ratio (last resort)
+- **RPC** — on-chain contract calls (Uniswap v2/v3/v4 on Robinhood Chain, PancakeSwap v3 on BSC, v4 `StateView`)
+- **Blockscout** (`robinhoodchain.blockscout.com`) — wallet token holdings, NFT transfer history (position age), chain coin price, token `exchange_rate` fallback (Robinhood Chain only)
+- **BscScan** (`api.bscscan.com`) — PancakeSwap v3 NFT transfer history (mint timestamp) (BSC only)
+- **DexScreener** (`api.dexscreener.com`) — market USD prices, taken from the highest-liquidity pool on the active chain per token (free, no API key)
+- Price resolution order: DexScreener market price → Blockscout `exchange_rate` (Robinhood only) → pool spot ratio (last resort)
 
 ### Notes
 

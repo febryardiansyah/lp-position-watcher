@@ -1,5 +1,6 @@
 import { getAddress, type Address } from 'viem';
 
+import { BSC_CONFIG, ROBINHOOD_CHAIN } from '../constants/chain.js';
 import { fetchJson } from '../lib/http.js';
 import type { AnyPosition, TokenMetadata } from './lp-position.service.js';
 
@@ -30,31 +31,82 @@ type DexScreenerTokenResponse = {
   pairs?: DexScreenerPair[];
 };
 
+type ChainContext = {
+  chainId: number;
+  dexscreenerChainId: string;
+  nativeSymbol: 'ETH' | 'BNB';
+  wrappedAddress: string;
+};
+
+const CHAIN_CONTEXTS: Record<'robinhood' | 'bsc', ChainContext> = {
+  robinhood: {
+    chainId: ROBINHOOD_CHAIN.id,
+    dexscreenerChainId: 'robinhood',
+    nativeSymbol: 'ETH',
+    wrappedAddress: WETH_ADDRESS,
+  },
+  bsc: {
+    chainId: BSC_CONFIG.id,
+    dexscreenerChainId: BSC_CONFIG.dexscreenerChainId,
+    nativeSymbol: 'BNB',
+    wrappedAddress: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',
+  },
+};
+
 const priceCache = new Map<string, Promise<number | null>>();
-let ethPricePromise: Promise<number | null> | null = null;
+const ethPricePromiseByChain = new Map<number, Promise<number | null>>();
 
 export function isEthToken(token: string): boolean {
   const normalized = getAddress(token).toLowerCase();
   return normalized === ZERO_ADDRESS || normalized === WETH_ADDRESS;
 }
 
-export function getEthUsdPrice(): Promise<number | null> {
-  if (!ethPricePromise) {
-    ethPricePromise = (async () => {
-      try {
-        const data = await fetchJson<BlockscoutStatsResponse>(`${BLOCKSCOUT_API_BASE}/v2/stats`);
-        return parsePrice(data.coin_price);
-      } catch {
-        return null;
-      }
-    })();
-  }
-
-  return ethPricePromise;
+export function isWrappedBnb(token: string): boolean {
+  const normalized = getAddress(token).toLowerCase();
+  return normalized === CHAIN_CONTEXTS.bsc.wrappedAddress.toLowerCase();
 }
 
-function getDexScreenerUsdPrice(token: string): Promise<number | null> {
-  const cacheKey = `dexscreener:${token.toLowerCase()}`;
+export function isNativeTokenForChain(token: string, chainId: number): boolean {
+  const normalized = getAddress(token).toLowerCase();
+  if (chainId === ROBINHOOD_CHAIN.id) return isEthToken(normalized);
+  if (chainId === BSC_CONFIG.id) return normalized === ZERO_ADDRESS || isWrappedBnb(normalized);
+  return false;
+}
+
+export function getNativeUsdPrice(chainId: number): Promise<number | null> {
+  const cached = ethPricePromiseByChain.get(chainId);
+  if (cached) return cached;
+
+  const promise = (async () => {
+    const ctx = chainId === BSC_CONFIG.id ? CHAIN_CONTEXTS.bsc : CHAIN_CONTEXTS.robinhood;
+    try {
+      if (ctx.chainId === ROBINHOOD_CHAIN.id) {
+        const data = await fetchJson<BlockscoutStatsResponse>(`${BLOCKSCOUT_API_BASE}/v2/stats`);
+        return parsePrice(data.coin_price);
+      }
+      const data = await fetchJson<DexScreenerTokenResponse>(
+        `${DEXSCREENER_API_BASE}/tokens/${ctx.wrappedAddress}`,
+      );
+      const pairs = (data.pairs ?? [])
+        .filter((pair) => pair.chainId === ctx.dexscreenerChainId)
+        .filter((pair) => parsePrice(pair.priceUsd) !== null);
+      if (pairs.length === 0) return null;
+      pairs.sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0));
+      return parsePrice(pairs[0].priceUsd);
+    } catch {
+      return null;
+    }
+  })();
+
+  ethPricePromiseByChain.set(chainId, promise);
+  return promise;
+}
+
+function getDexScreenerUsdPrice(
+  token: string,
+  dexscreenerChainId: string,
+): Promise<number | null> {
+  const cacheKey = `dexscreener:${dexscreenerChainId}:${token.toLowerCase()}`;
   const cached = priceCache.get(cacheKey);
   if (cached) return cached;
 
@@ -64,17 +116,17 @@ function getDexScreenerUsdPrice(token: string): Promise<number | null> {
         `${DEXSCREENER_API_BASE}/tokens/${token.toLowerCase()}`,
       );
 
-      const robinhoodPairs = (data.pairs ?? [])
-        .filter((pair) => pair.chainId === 'robinhood')
+      const matching = (data.pairs ?? [])
+        .filter((pair) => pair.chainId === dexscreenerChainId)
         .filter((pair) => parsePrice(pair.priceUsd) !== null);
 
-      if (robinhoodPairs.length === 0) return null;
+      if (matching.length === 0) return null;
 
-      robinhoodPairs.sort(
+      matching.sort(
         (a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0),
       );
 
-      return parsePrice(robinhoodPairs[0].priceUsd);
+      return parsePrice(matching[0].priceUsd);
     } catch {
       return null;
     }
@@ -84,30 +136,35 @@ function getDexScreenerUsdPrice(token: string): Promise<number | null> {
   return promise;
 }
 
-export function getUsdPrice(token: Address): Promise<number | null> {
+export function getUsdPrice(token: Address, chainId: number = ROBINHOOD_CHAIN.id): Promise<number | null> {
+  const ctx = chainId === BSC_CONFIG.id ? CHAIN_CONTEXTS.bsc : CHAIN_CONTEXTS.robinhood;
   const normalized = getAddress(token).toLowerCase();
-  const cached = priceCache.get(normalized);
+  const cacheKey = `${chainId}:${normalized}`;
+  const cached = priceCache.get(cacheKey);
   if (cached) return cached;
 
   const promise = (async () => {
     try {
-      if (isEthToken(normalized)) {
-        return await getEthUsdPrice();
+      if (isNativeTokenForChain(normalized, chainId)) {
+        return await getNativeUsdPrice(chainId);
       }
 
-      const dexPrice = await getDexScreenerUsdPrice(normalized);
+      const dexPrice = await getDexScreenerUsdPrice(normalized, ctx.dexscreenerChainId);
       if (dexPrice !== null) return dexPrice;
 
-      const data = await fetchJson<BlockscoutTokenResponse>(
-        `${BLOCKSCOUT_API_BASE}/v2/tokens/${normalized}`,
-      );
-      return parsePrice(data.exchange_rate);
+      if (chainId === ROBINHOOD_CHAIN.id) {
+        const data = await fetchJson<BlockscoutTokenResponse>(
+          `${BLOCKSCOUT_API_BASE}/v2/tokens/${normalized}`,
+        );
+        return parsePrice(data.exchange_rate);
+      }
+      return null;
     } catch {
       return null;
     }
   })();
 
-  priceCache.set(normalized, promise);
+  priceCache.set(cacheKey, promise);
   return promise;
 }
 
@@ -151,8 +208,13 @@ export async function resolvePairPrices(args: {
   decimals0: number;
   decimals1: number;
   pool: PairPoolContext;
+  chainId?: number;
 }): Promise<PairUsdPrices> {
-  const [price0, price1] = await Promise.all([getUsdPrice(args.token0), getUsdPrice(args.token1)]);
+  const chainId = args.chainId ?? ROBINHOOD_CHAIN.id;
+  const [price0, price1] = await Promise.all([
+    getUsdPrice(args.token0, chainId),
+    getUsdPrice(args.token1, chainId),
+  ]);
 
   if (price0 !== null && price1 !== null) {
     return { price0, price1 };
@@ -194,7 +256,10 @@ export function positionKey(position: AnyPosition): string {
   }
 }
 
-export async function valuePosition(position: AnyPosition): Promise<PositionValuation> {
+export async function valuePosition(
+  position: AnyPosition,
+  chainId: number = ROBINHOOD_CHAIN.id,
+): Promise<PositionValuation> {
   if (position.protocol === 'v2') {
     const prices = await resolvePairPrices({
       token0: position.token0.address,
@@ -206,6 +271,7 @@ export async function valuePosition(position: AnyPosition): Promise<PositionValu
         amount0: position.token0.principal,
         amount1: position.token1.principal,
       },
+      chainId,
     });
 
     const amount0 = Number(position.token0.principal);
@@ -229,6 +295,7 @@ export async function valuePosition(position: AnyPosition): Promise<PositionValu
       sqrtPriceX96: position.sqrtPriceX96,
       token0: position.token0,
       token1: position.token1,
+      chainId,
     });
   }
 
@@ -246,6 +313,7 @@ export async function valuePosition(position: AnyPosition): Promise<PositionValu
     sqrtPriceX96: position.sqrtPriceX96,
     token0: position.token0,
     token1: position.token1,
+    chainId,
   });
 }
 
@@ -253,13 +321,16 @@ async function valueConcentrated(args: {
   sqrtPriceX96: string;
   token0: TokenMetadata & { principal: string; uncollectedFees: string };
   token1: TokenMetadata & { principal: string; uncollectedFees: string };
+  chainId?: number;
 }): Promise<PositionValuation> {
+  const chainId = args.chainId ?? ROBINHOOD_CHAIN.id;
   const prices = await resolvePairPrices({
     token0: args.token0.address,
     token1: args.token1.address,
     decimals0: args.token0.decimals,
     decimals1: args.token1.decimals,
     pool: { kind: 'v3', sqrtPriceX96: args.sqrtPriceX96 },
+    chainId,
   });
 
   const principal0 = Number(args.token0.principal);
@@ -314,12 +385,15 @@ export type WalletValuation = {
   perPosition: Record<string, PositionValuation>;
 };
 
-export async function valuePositions(positions: AnyPosition[]): Promise<WalletValuation> {
+export async function valuePositions(
+  positions: AnyPosition[],
+  chainId: number = ROBINHOOD_CHAIN.id,
+): Promise<WalletValuation> {
   const perPosition: Record<string, PositionValuation> = {};
 
   for (let i = 0; i < positions.length; i += 10) {
     const batch = positions.slice(i, i + 10);
-    const valuations = await Promise.all(batch.map((position) => valuePosition(position)));
+    const valuations = await Promise.all(batch.map((position) => valuePosition(position, chainId)));
     for (let j = 0; j < batch.length; j++) {
       perPosition[positionKey(batch[j])] = valuations[j];
     }

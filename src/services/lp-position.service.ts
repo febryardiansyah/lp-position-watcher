@@ -1,10 +1,13 @@
-import { encodeAbiParameters, getAddress, keccak256, type Address } from 'viem';
+import { encodeAbiParameters, getAddress, keccak256, type Address, type PublicClient } from 'viem';
 import { z } from 'zod';
 
-import { ROBINHOOD_CHAIN, UNISWAP_CONTRACTS } from '../constants/chain.js';
+import { BSC_CONFIG, ROBINHOOD_CHAIN, UNISWAP_CONTRACTS, type ChainName } from '../constants/chain.js';
+import { env } from '../config/env.js';
+import { publicClientBsc } from '../lib/bsc-public-client.js';
+import { getNftTransferHistory } from '../lib/bscscan.js';
 import { fetchJson } from '../lib/http.js';
-import { loadNftAgeCache, saveNftAgeCache } from '../lib/storage.js';
 import { publicClient } from '../lib/public-client.js';
+import { loadNftAgeCache, saveNftAgeCache } from '../lib/storage.js';
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 const BLOCKSCOUT_API_BASE = 'https://robinhoodchain.blockscout.com/api';
@@ -16,7 +19,8 @@ export const walletInputSchema = z.object({
     .string()
     .regex(/^0x[a-fA-F0-9]{40}$/, 'wallet must be a valid EVM address')
     .transform((value) => getAddress(value)),
-  chainId: z.coerce.number().int().positive().default(ROBINHOOD_CHAIN.id),
+  chain: z.enum(['robinhood', 'bsc']).default('robinhood'),
+  chainId: z.coerce.number().int().positive().optional(),
   protocol: z.enum(['all', 'v2', 'v3', 'v4']).default('all'),
 });
 
@@ -42,6 +46,7 @@ export type V2Position = {
 
 export type V3Position = {
   protocol: 'v3';
+  provider: 'uniswap' | 'pancake';
   tokenId: string;
   poolAddress: Address;
   feeTier: number;
@@ -101,6 +106,7 @@ export type AnyPosition = V2Position | V3Position | V4Position;
 export type WalletLpReadResult = {
   wallet: Address;
   chainId: number;
+  chainName: ChainName;
   protocol: ProtocolFilter;
   summary: {
     positionsOpen: number;
@@ -108,6 +114,10 @@ export type WalletLpReadResult = {
       v2: number;
       v3: number;
       v4: number;
+    };
+    byProvider: {
+      uniswap: number;
+      pancake: number;
     };
   };
   positions: AnyPosition[];
@@ -286,6 +296,89 @@ const v3NpmAbi = [
   },
 ] as const;
 
+const pancakeV3NpmAbi = [
+  {
+    type: 'function',
+    name: 'balanceOf',
+    stateMutability: 'view',
+    inputs: [{ name: 'owner', type: 'address' }],
+    outputs: [{ name: '', type: 'uint256' }],
+  },
+  {
+    type: 'function',
+    name: 'tokenOfOwnerByIndex',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'owner', type: 'address' },
+      { name: 'index', type: 'uint256' },
+    ],
+    outputs: [{ name: '', type: 'uint256' }],
+  },
+  {
+    type: 'function',
+    name: 'positions',
+    stateMutability: 'view',
+    inputs: [{ name: 'tokenId', type: 'uint256' }],
+    outputs: [
+      { name: 'nonce', type: 'uint96' },
+      { name: 'operator', type: 'address' },
+      { name: 'token0', type: 'address' },
+      { name: 'token1', type: 'address' },
+      { name: 'fee', type: 'uint24' },
+      { name: 'tickLower', type: 'int24' },
+      { name: 'tickUpper', type: 'int24' },
+      { name: 'liquidity', type: 'uint128' },
+      { name: 'feeGrowthInside0LastX128', type: 'uint256' },
+      { name: 'feeGrowthInside1LastX128', type: 'uint256' },
+      { name: 'tokensOwed0', type: 'uint128' },
+      { name: 'tokensOwed1', type: 'uint128' },
+    ],
+  },
+  {
+    type: 'function',
+    name: 'collect',
+    stateMutability: 'nonpayable',
+    inputs: [
+      {
+        name: 'params',
+        type: 'tuple',
+        components: [
+          { name: 'tokenId', type: 'uint256' },
+          { name: 'recipient', type: 'address' },
+          { name: 'amount0Max', type: 'uint128' },
+          { name: 'amount1Max', type: 'uint128' },
+        ],
+      },
+    ],
+    outputs: [
+      { name: 'amount0', type: 'uint256' },
+      { name: 'amount1', type: 'uint256' },
+    ],
+  },
+  {
+    type: 'function',
+    name: 'decreaseLiquidity',
+    stateMutability: 'nonpayable',
+    inputs: [
+      {
+        name: 'params',
+        type: 'tuple',
+        components: [
+          { name: 'tokenId', type: 'uint256' },
+          { name: 'liquidity', type: 'uint128' },
+          { name: 'amount0Min', type: 'uint256' },
+          { name: 'amount1Min', type: 'uint256' },
+          { name: 'deadline', type: 'uint256' },
+        ],
+      },
+    ],
+    outputs: [
+      { name: 'amount0', type: 'uint256' },
+      { name: 'amount1', type: 'uint256' },
+    ],
+  },
+] as const;
+
 const v3FactoryAbi = [
   {
     type: 'function',
@@ -407,11 +500,22 @@ const v4StateViewAbi = [
 const tokenMetadataCache = new Map<string, Promise<TokenMetadata>>();
 
 export async function getWalletUniswapPositions(input: unknown): Promise<WalletLpReadResult> {
-  const query = walletInputSchema.parse(input);
+  const raw = walletInputSchema.parse(input);
+  const query = {
+    ...raw,
+    chain: raw.chain,
+    chainId: raw.chainId ?? (raw.chain === 'bsc' ? env.BSC_CHAIN_ID : ROBINHOOD_CHAIN.id),
+  };
 
-  if (query.chainId !== ROBINHOOD_CHAIN.id) {
+  if (query.chain === 'robinhood' && query.chainId !== ROBINHOOD_CHAIN.id) {
     throw new Error(
-      `Unsupported chainId ${query.chainId}. This script currently supports Robinhood Chain (${ROBINHOOD_CHAIN.id}) only.`,
+      `Unsupported chainId ${query.chainId}. This script currently supports Robinhood Chain (${ROBINHOOD_CHAIN.id}) only on the robinhood chain.`,
+    );
+  }
+
+  if (query.chain === 'bsc' && query.chainId !== BSC_CONFIG.id) {
+    throw new Error(
+      `Unsupported chainId ${query.chainId}. BSC path uses chain ${BSC_CONFIG.id}.`,
     );
   }
 
@@ -420,19 +524,34 @@ export async function getWalletUniswapPositions(input: unknown): Promise<WalletL
   const includeV3 = query.protocol === 'all' || query.protocol === 'v3';
   const includeV4 = query.protocol === 'all' || query.protocol === 'v4';
 
-  const [v2Positions, v3Positions, v4Positions] = await Promise.all([
-    includeV2 ? readV2Positions(owner) : Promise.resolve([]),
-    includeV3 ? readV3Positions(owner) : Promise.resolve([]),
-    includeV4 ? readV4Positions(owner) : Promise.resolve([]),
-  ]);
+  let v2Positions: V2Position[] = [];
+  let v3Uniswap: V3Position[] = [];
+  let v3Pancake: V3Position[] = [];
+  let v4Positions: V4Position[] = [];
 
+  if (query.chain === 'robinhood') {
+    [v2Positions, v3Uniswap, v4Positions] = await Promise.all([
+      includeV2 ? readV2Positions(owner) : Promise.resolve([]),
+      includeV3 ? readV3Positions(owner) : Promise.resolve([]),
+      includeV4 ? readV4Positions(owner) : Promise.resolve([]),
+    ]);
+  } else {
+    [v3Pancake] = await Promise.all([
+      includeV3 ? readPancakeV3Positions(owner, env.BSCSCAN_API_KEY) : Promise.resolve([]),
+    ]);
+  }
+
+  const v3Positions: V3Position[] = [...v3Uniswap, ...v3Pancake];
   const positions: AnyPosition[] = [...v2Positions, ...v3Positions, ...v4Positions];
 
-  flushNftAgeCache();
+  if (query.chain === 'robinhood') {
+    flushNftAgeCache();
+  }
 
   return {
     wallet: owner,
     chainId: query.chainId,
+    chainName: query.chain,
     protocol: query.protocol,
     summary: {
       positionsOpen: positions.length,
@@ -441,15 +560,29 @@ export async function getWalletUniswapPositions(input: unknown): Promise<WalletL
         v3: v3Positions.length,
         v4: v4Positions.length,
       },
+      byProvider: {
+        uniswap: v3Uniswap.length,
+        pancake: v3Pancake.length,
+      },
     },
     positions,
-    notes: [
-      'Uniswap v2 positions are identified from wallet-held ERC-20s and verified against Uniswap v2 factory.',
-      'Uniswap v3 positions include principal and uncollected fees via static simulation.',
-      'Uniswap v4 positions are discovered from Blockscout NFT transfer history, then verified by ownerOf.',
-      'v4 amounts, in-range status, and uncollected fees are read from the v4 StateView contract (pool slot0, position info, fee growth).',
-      'Run `track` to persist a snapshot and diff it against the previous one for PnL-style tracking.',
-    ],
+    notes:
+      query.chain === 'robinhood'
+        ? [
+            'Uniswap v2 positions are identified from wallet-held ERC-20s and verified against Uniswap v2 factory.',
+            'Uniswap v3 positions include principal and uncollected fees via static simulation.',
+            'Uniswap v4 positions are discovered from Blockscout NFT transfer history, then verified by ownerOf.',
+            'v4 amounts, in-range status, and uncollected fees are read from the v4 StateView contract (pool slot0, position info, fee growth).',
+            'Run `track` to persist a snapshot and diff it against the previous one for PnL-style tracking.',
+          ]
+        : [
+            `Reading PancakeSwap v3 positions on ${BSC_CONFIG.name} (chain ${BSC_CONFIG.id}).`,
+            'Positions are discovered from the PancakeSwap v3 NonfungiblePositionManager (balanceOf / tokenOfOwnerByIndex).',
+            'Pool state (sqrtPriceX96, current tick) is read from each PancakeV3Pool via slot0.',
+            'Principal and uncollected fees are computed via static simulation of decreaseLiquidity / collect on the position manager.',
+            'NFT mint timestamps are fetched from BscScan (set BSCSCAN_API_KEY to lift the 5 req/s free-tier limit).',
+            'v2 and v4 positions are not read on BSC in this slice.',
+          ],
   };
 }
 
@@ -546,17 +679,61 @@ async function readV3Positions(owner: Address): Promise<V3Position[]> {
   const positionManager = UNISWAP_CONTRACTS.v3NonfungiblePositionManager as Address;
   const v3Factory = UNISWAP_CONTRACTS.v3Factory as Address;
 
-  const balance = await publicClient.readContract({
+  return readV3LikePositions({
+    owner,
+    client: publicClient,
+    positionManager,
+    factory: v3Factory,
+    npmAbi: v3NpmAbi,
+    provider: 'uniswap',
+    fetchCreatedAt: (tokenId) => fetchNftCreatedAt(positionManager, tokenId),
+  });
+}
+
+async function readPancakeV3Positions(
+  owner: Address,
+  bscscanApiKey?: string,
+): Promise<V3Position[]> {
+  const positionManager = BSC_CONFIG.pancake.v3Npm as Address;
+  const pancakeV3Factory = BSC_CONFIG.pancake.v3Factory as Address;
+
+  return readV3LikePositions({
+    owner,
+    client: publicClientBsc,
+    positionManager,
+    factory: pancakeV3Factory,
+    npmAbi: pancakeV3NpmAbi,
+    provider: 'pancake',
+    fetchCreatedAt: (tokenId) =>
+      getNftTransferHistory(positionManager, tokenId, { apiKey: bscscanApiKey }).then((ts) =>
+        ts ? new Date(Number(ts) * 1000).toISOString() : null,
+      ),
+  });
+}
+
+async function readV3LikePositions(args: {
+  owner: Address;
+  client: PublicClient;
+  positionManager: Address;
+  factory: Address;
+  npmAbi: typeof v3NpmAbi | typeof pancakeV3NpmAbi;
+  provider: 'uniswap' | 'pancake';
+  fetchCreatedAt: (tokenId: bigint) => Promise<string | null>;
+}): Promise<V3Position[]> {
+  const { owner, client, positionManager, factory, npmAbi, provider, fetchCreatedAt } = args;
+
+  const balance = await client.readContract({
     address: positionManager,
-    abi: v3NpmAbi,
+    abi: npmAbi,
     functionName: 'balanceOf',
     args: [owner],
   });
 
-  const tokenIds = (await multicallReads<bigint>(
+  const tokenIds = (await multicallReadsOn<bigint>(
+    client,
     Array.from({ length: Number(balance) }, (_, index) => ({
       address: positionManager,
-      abi: v3NpmAbi,
+      abi: npmAbi,
       functionName: 'tokenOfOwnerByIndex',
       args: [owner, BigInt(index)],
     })),
@@ -564,10 +741,13 @@ async function readV3Positions(owner: Address): Promise<V3Position[]> {
 
   if (tokenIds.length === 0) return [];
 
-  const positionDataResults = await multicallReads<readonly [bigint, Address, Address, Address, number, number, number, bigint, bigint, bigint, bigint, bigint]>(
+  const positionDataResults = await multicallReadsOn<
+    readonly [bigint, Address, Address, Address, number, number, number, bigint, bigint, bigint, bigint, bigint]
+  >(
+    client,
     tokenIds.map((tokenId) => ({
       address: positionManager,
-      abi: v3NpmAbi,
+      abi: npmAbi,
       functionName: 'positions',
       args: [tokenId],
     })),
@@ -575,7 +755,10 @@ async function readV3Positions(owner: Address): Promise<V3Position[]> {
 
   const validPositions = tokenIds
     .map((tokenId, index) => ({ tokenId, data: positionDataResults[index] }))
-    .filter((item): item is { tokenId: bigint; data: readonly [bigint, Address, Address, Address, number, number, number, bigint, bigint, bigint, bigint, bigint] } => item.data !== null)
+    .filter(
+      (item): item is { tokenId: bigint; data: readonly [bigint, Address, Address, Address, number, number, number, bigint, bigint, bigint, bigint, bigint] } =>
+        item.data !== null,
+    )
     .map(({ tokenId, data }) => ({
       tokenId,
       token0Address: getAddress(data[2]),
@@ -586,9 +769,10 @@ async function readV3Positions(owner: Address): Promise<V3Position[]> {
       positionLiquidity: data[7],
     }));
 
-  const poolAddressResults = await multicallReads<Address>(
+  const poolAddressResults = await multicallReadsOn<Address>(
+    client,
     validPositions.map((position) => ({
-      address: v3Factory,
+      address: factory,
       abi: v3FactoryAbi,
       functionName: 'getPool',
       args: [position.token0Address, position.token1Address, position.feeTier],
@@ -597,11 +781,13 @@ async function readV3Positions(owner: Address): Promise<V3Position[]> {
 
   const withPools = validPositions
     .map((position, index) => ({ position, poolAddress: poolAddressResults[index] }))
-    .filter((item): item is { position: (typeof validPositions)[number]; poolAddress: Address } =>
-      item.poolAddress !== null && item.poolAddress.toLowerCase() !== ZERO_ADDRESS,
+    .filter(
+      (item): item is { position: (typeof validPositions)[number]; poolAddress: Address } =>
+        item.poolAddress !== null && item.poolAddress.toLowerCase() !== ZERO_ADDRESS,
     );
 
-  const slot0Results = await multicallReads<V3Slot0>(
+  const slot0Results = await multicallReadsOn<V3Slot0>(
+    client,
     withPools.map(({ poolAddress }) => ({
       address: poolAddress,
       abi: v3PoolAbi,
@@ -610,7 +796,7 @@ async function readV3Positions(owner: Address): Promise<V3Position[]> {
   );
 
   const tokenAddresses = withPools.flatMap(({ position }) => [position.token0Address, position.token1Address]);
-  await prefetchTokenMetadata(tokenAddresses);
+  await prefetchTokenMetadataOn(client, tokenAddresses);
 
   const positions = await mapInBatches(withPools, 16, async ({ position, poolAddress }, index) => {
     const slot0 = slot0Results[index];
@@ -618,18 +804,19 @@ async function readV3Positions(owner: Address): Promise<V3Position[]> {
 
     const token0Meta = await getTokenMetadata(position.token0Address);
     const token1Meta = await getTokenMetadata(position.token1Address);
-    const createdAt = await fetchNftCreatedAt(positionManager, position.tokenId);
-    const simulatedCollect = await safeSimulateCollect(positionManager, owner, position.tokenId);
+    const createdAt = await fetchCreatedAt(position.tokenId);
+    const simulatedCollect = await safeSimulateCollect(client, positionManager, owner, position.tokenId, npmAbi);
     const simulatedDecrease =
       position.positionLiquidity === 0n
         ? [0n, 0n]
-        : await safeSimulateDecrease(positionManager, owner, position.tokenId, position.positionLiquidity);
+        : await safeSimulateDecrease(client, positionManager, owner, position.tokenId, position.positionLiquidity, npmAbi);
 
     const tickCurrent = Number(slot0[1]);
     const sqrtPriceX96 = slot0[0];
 
     return {
       protocol: 'v3',
+      provider,
       tokenId: position.tokenId.toString(),
       poolAddress: getAddress(poolAddress),
       feeTier: position.feeTier,
@@ -1003,14 +1190,16 @@ function sqrtRatioAtTick(tick: number): bigint {
 }
 
 async function safeSimulateCollect(
+  client: PublicClient,
   positionManager: Address,
   owner: Address,
   tokenId: bigint,
+  abi: typeof v3NpmAbi | typeof pancakeV3NpmAbi = v3NpmAbi,
 ): Promise<[bigint, bigint]> {
   try {
-    const simulated = await publicClient.simulateContract({
+    const simulated = await client.simulateContract({
       address: positionManager,
-      abi: v3NpmAbi,
+      abi,
       functionName: 'collect',
       args: [
         {
@@ -1030,15 +1219,17 @@ async function safeSimulateCollect(
 }
 
 async function safeSimulateDecrease(
+  client: PublicClient,
   positionManager: Address,
   owner: Address,
   tokenId: bigint,
   liquidity: bigint,
+  abi: typeof v3NpmAbi | typeof pancakeV3NpmAbi = v3NpmAbi,
 ): Promise<[bigint, bigint]> {
   try {
-    const simulated = await publicClient.simulateContract({
+    const simulated = await client.simulateContract({
       address: positionManager,
-      abi: v3NpmAbi,
+      abi,
       functionName: 'decreaseLiquidity',
       args: [
         {
@@ -1374,13 +1565,20 @@ type MulticallResult<T> = {
 const MULTICALL_BATCH_SIZE = 64;
 
 async function multicallReads<T>(calls: MulticallCall[]): Promise<(T | null)[]> {
+  return multicallReadsOn<T>(publicClient, calls);
+}
+
+async function multicallReadsOn<T>(
+  client: PublicClient,
+  calls: MulticallCall[],
+): Promise<(T | null)[]> {
   const results: (T | null)[] = [];
 
   for (let i = 0; i < calls.length; i += MULTICALL_BATCH_SIZE) {
     const chunk = calls.slice(i, i + MULTICALL_BATCH_SIZE);
 
     const batch = (await withRetries(() =>
-      publicClient.multicall({
+      client.multicall({
         contracts: chunk as never,
         allowFailure: true,
       }),
@@ -1395,6 +1593,13 @@ async function multicallReads<T>(calls: MulticallCall[]): Promise<(T | null)[]> 
 }
 
 async function prefetchTokenMetadata(addresses: readonly Address[]): Promise<void> {
+  await prefetchTokenMetadataOn(publicClient, addresses);
+}
+
+async function prefetchTokenMetadataOn(
+  client: PublicClient,
+  addresses: readonly Address[],
+): Promise<void> {
   const unique = [...new Set(addresses.map((address) => getAddress(address).toLowerCase() as Address))];
   const missing = unique.filter((address) => !tokenMetadataCache.has(address));
   if (missing.length === 0) return;
@@ -1405,7 +1610,7 @@ async function prefetchTokenMetadata(addresses: readonly Address[]): Promise<voi
     calls.push({ address, abi: erc20MetadataAbi, functionName: 'decimals' });
   }
 
-  const results = await multicallReads<string | number>(calls);
+  const results = await multicallReadsOn<string | number>(client, calls);
 
   for (let i = 0; i < missing.length; i++) {
     const address = missing[i];

@@ -64,7 +64,7 @@ export async function trackWalletPositions(input: unknown): Promise<TrackResult>
     publicClient.getBlockNumber(),
   ]);
 
-  const valuation = await valuePositions(read.positions);
+  const valuation = await valuePositions(read.positions, read.chainId);
   const previous = latestSnapshot(wallet);
 
   const snapshot: PositionSnapshot = {
@@ -81,7 +81,7 @@ export async function trackWalletPositions(input: unknown): Promise<TrackResult>
 
   return {
     wallet,
-    chainId: query.chainId,
+    chainId: read.chainId,
     trackedAt: snapshot.timestamp,
     blockNumber: snapshot.blockNumber,
     read,
@@ -128,7 +128,7 @@ export async function getWalletHistory(input: unknown): Promise<HistoryResult> {
 
   return {
     wallet,
-    chainId: query.chainId,
+    chainId: query.chainId ?? (query.chain === 'bsc' ? 56 : 4663),
     snapshots,
   };
 }
@@ -156,7 +156,7 @@ export async function getWalletDiff(input: unknown): Promise<DiffResult> {
 
   return {
     wallet,
-    chainId: query.chainId,
+    chainId: query.chainId ?? (query.chain === 'bsc' ? 56 : 4663),
     previous,
     current,
     changes: diffPositions(previous.positions, current.positions),

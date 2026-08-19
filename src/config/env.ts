@@ -6,6 +6,9 @@ const envSchema = z.object({
   RH_RPC_URL: z.url().default('https://rpc.mainnet.chain.robinhood.com'),
   RH_DATA_DIR: z.string().default('data'),
   RH_MAX_SNAPSHOTS: z.coerce.number().int().positive().default(200),
+  BSC_RPC_URL: z.url().optional(),
+  BSCSCAN_API_KEY: z.string().optional(),
+  BSC_CHAIN_ID: z.coerce.number().int().positive().default(56),
   WALLET_ADDRESS: z
     .string()
     .regex(/^0x[a-fA-F0-9]{40}$/, 'WALLET_ADDRESS must be a valid EVM address')
