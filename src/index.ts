@@ -35,6 +35,10 @@ const USAGE = `Usage:
   npm run dev -- diff <walletAddress>       Diff the two most recent snapshots
   npm run dev -- help                       Show this help
 
+Chain selection:
+  --chain <robinhood|bsc>   Which chain to read (default: robinhood).
+                             'bsc' reads PancakeSwap v3 positions on BNB Smart Chain.
+
 Pagination options (portfolio view):
   --limit <n>   Max closed positions per page (default 15)
   --page <n>    Page of closed positions to show (default 1)
@@ -71,6 +75,14 @@ async function main() {
   const page = pageIndex !== -1 && args[pageIndex + 1] ? Number(args[pageIndex + 1]) : undefined;
   if (pageIndex !== -1) args.splice(pageIndex, 2);
 
+  const chainIndex = args.indexOf('--chain');
+  const chainRaw = chainIndex !== -1 && args[chainIndex + 1] ? args[chainIndex + 1] : undefined;
+  if (chainIndex !== -1) args.splice(chainIndex, 2);
+  const chain: 'robinhood' | 'bsc' =
+    chainRaw === 'bsc' ? 'bsc' : chainRaw === 'robinhood' || chainRaw === undefined ? 'robinhood' : (() => {
+      throw new Error(`Unknown --chain value "${chainRaw}". Use 'robinhood' or 'bsc'.`);
+    })();
+
   const first = args[0];
 
   const isCommand = !!first && !first.startsWith('0x');
@@ -86,7 +98,8 @@ async function main() {
   const input = {
     protocol: 'all' as const,
     wallet,
-    chainId: env.RH_CHAIN_ID,
+    chain,
+    chainId: chain === 'bsc' ? env.BSC_CHAIN_ID : env.RH_CHAIN_ID,
   };
 
   switch (command) {
@@ -99,7 +112,7 @@ async function main() {
         return;
       }
 
-      const valuation = await valuePositions(read.positions);
+      const valuation = await valuePositions(read.positions, read.chainId);
       console.log(renderPortfolio(read, valuation, { limit, page }));
       return;
     }

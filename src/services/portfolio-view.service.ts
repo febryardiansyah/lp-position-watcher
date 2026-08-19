@@ -43,12 +43,15 @@ export function renderPortfolio(
   ).length;
 
   lines.push(`Wallet: ${read.wallet}`);
-  lines.push(`Chain: Robinhood Chain (${read.chainId})`);
+  lines.push(`Chain: ${chainLabel(read)}`);
   lines.push('');
   lines.push(`Total Value: ${formatUsd(valuation.totalUsd)}`);
   lines.push(
     `Positions: ${read.summary.positionsOpen} (v2: ${read.summary.byProtocol.v2}, v3: ${read.summary.byProtocol.v3}, v4: ${read.summary.byProtocol.v4})`,
   );
+  if (read.chainName === 'bsc') {
+    lines.push(`Providers: uniswap ${read.summary.byProvider.uniswap}, pancake ${read.summary.byProvider.pancake}`);
+  }
   lines.push(
     `In range: ${inRangeCount}   Out of range: ${outOfRangeCount}   Unclaimed fees: ${formatUsd(valuation.feesUsd)}`,
   );
@@ -153,7 +156,8 @@ function buildRow(position: AnyPosition, index: number, valuation: WalletValuati
   } else {
     const token0 = position.token0;
     const token1 = position.token1;
-    pool = token0 && token1 ? `${token0.symbol}/${token1.symbol}` : `#${position.tokenId}`;
+    const basePool = token0 && token1 ? `${token0.symbol}/${token1.symbol}` : `#${position.tokenId}`;
+    pool = position.protocol === 'v3' && position.provider === 'pancake' ? `[pancake] ${basePool}` : basePool;
 
     if (position.protocol === 'v3') {
       inRange = position.inRange ? 'yes' : 'no';
@@ -242,4 +246,9 @@ function trimAmount(value: string): string {
   const trimmed = value.replace(/\.?0+$/, '') || '0';
   if (trimmed.length > 14) return `${trimmed.slice(0, 14)}…`;
   return trimmed;
+}
+
+function chainLabel(read: WalletLpReadResult): string {
+  if (read.chainName === 'bsc') return `BNB Smart Chain (${read.chainId})`;
+  return `Robinhood Chain (${read.chainId})`;
 }

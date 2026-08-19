@@ -1,5 +1,5 @@
 {
-  "name": "robinhood-lp-position",
+  "name": "lp-position-watcher",
   "version": "1.0.0",
   "description": "Robinhood Chain Uniswap LP position CLI",
   "main": "dist/index.js",
