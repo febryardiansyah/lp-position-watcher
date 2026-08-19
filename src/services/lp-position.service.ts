@@ -703,7 +703,8 @@ async function readPancakeV3Positions(owner: Address): Promise<V3Position[]> {
     factory: pancakeV3Factory,
     npmAbi: pancakeV3NpmAbi,
     provider: 'pancake',
-    fetchCreatedAt: (tokenId) => getBscNftMintTimestamp(positionManager, tokenId),
+    fetchCreatedAt: (tokenId, liquidity) =>
+      liquidity === 0n ? Promise.resolve(null) : getBscNftMintTimestamp(positionManager, tokenId),
   });
 }
 
@@ -714,7 +715,7 @@ async function readV3LikePositions(args: {
   factory: Address;
   npmAbi: typeof v3NpmAbi | typeof pancakeV3NpmAbi;
   provider: 'uniswap' | 'pancake';
-  fetchCreatedAt: (tokenId: bigint) => Promise<string | null>;
+  fetchCreatedAt: (tokenId: bigint, liquidity: bigint) => Promise<string | null>;
 }): Promise<V3Position[]> {
   const { owner, client, positionManager, factory, npmAbi, provider, fetchCreatedAt } = args;
 
@@ -800,7 +801,7 @@ async function readV3LikePositions(args: {
 
     const token0Meta = await getTokenMetadata(position.token0Address);
     const token1Meta = await getTokenMetadata(position.token1Address);
-    const createdAt = await fetchCreatedAt(position.tokenId);
+    const createdAt = await fetchCreatedAt(position.tokenId, position.positionLiquidity);
     const simulatedCollect = await safeSimulateCollect(client, positionManager, owner, position.tokenId, npmAbi);
     const simulatedDecrease =
       position.positionLiquidity === 0n

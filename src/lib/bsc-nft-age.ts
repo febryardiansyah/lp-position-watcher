@@ -43,6 +43,7 @@ let ageCacheDirty = false;
 // npmAddress (lowercase) -> tokenId -> ISO timestamp, built once per run
 const mintIndex = new Map<string, Map<string, string>>();
 const inflightIndex = new Map<string, Promise<void>>();
+const pendingByNpm = new Map<string, Set<string>>();
 const unsupported = new Set<string>(); // endpoints without alchemy_getAssetTransfers
 
 type TransfersResponse = {
@@ -79,20 +80,27 @@ async function ensureMintIndex(
   wanted: bigint[],
 ): Promise<void> {
   const key = positionManager.toLowerCase();
+
+  // All concurrent callers for the same NPM share one fetch: register their
+  // tokenIds in the pending set BEFORE awaiting the shared in-flight promise,
+  // so the loop keeps paging until every requested token is resolved.
+  let pending = pendingByNpm.get(key);
+  if (!pending) {
+    pending = new Set<string>();
+    pendingByNpm.set(key, pending);
+  }
+  for (const t of wanted) pending.add(t.toString());
+
   const existing = inflightIndex.get(key);
   if (existing) return existing;
-  if (mintIndex.has(key) || unsupported.has(key)) return;
-
-  // Nothing to resolve — avoid the fetch entirely.
-  if (wanted.length === 0) return;
-
-  const wantedSet = new Set(wanted.map((t) => t.toString()));
+  if (unsupported.has(key)) return;
 
   const promise = (async () => {
     const index = new Map<string, string>();
     let pageKey: string | null = null;
     let windowMin: string | null = null;
     let fullWindow = false;
+    let maxTokenId: bigint | null = null;
     try {
       for (let page = 0; page < MAX_PAGES; page++) {
         const res = await fetchMintPage(client, positionManager, pageKey);
@@ -107,13 +115,25 @@ async function ensureMintIndex(
             ageDiskCache[cacheKey] = ts;
             ageCacheDirty = true;
           }
-          wantedSet.delete(tokenId);
+          pending.delete(tokenId);
           if (windowMin === null || BigInt(tokenId) < BigInt(windowMin)) windowMin = tokenId;
+          if (maxTokenId === null || BigInt(tokenId) > maxTokenId) maxTokenId = BigInt(tokenId);
+        }
+
+        // PCS v3 tokenIds are sequential, so the newest mint seen in the first
+        // page IS the current max tokenId. Anything older than max - window is
+        // outside our coverage — drop it instead of paging for it forever
+        // (this is what made cold runs crawl when a wallet held an old position).
+        if (maxTokenId !== null) {
+          const floor = maxTokenId - BigInt(MAX_PAGES) * 1000n;
+          for (const t of [...pending]) {
+            if (BigInt(t) < floor) pending.delete(t);
+          }
         }
 
         pageKey = res.pageKey ?? null;
-        // Stop early once every requested tokenId has been resolved.
-        if (wantedSet.size === 0) break;
+        // Stop early once every requested tokenId has been resolved (or dropped).
+        if (pending.size === 0) break;
         if (!pageKey || transfers.length === 0) {
           fullWindow = true;
           break;
@@ -137,6 +157,8 @@ async function ensureMintIndex(
       // Endpoint doesn't support alchemy_getAssetTransfers (or failed) — don't
       // retry every position; mark unsupported for this run.
       unsupported.add(key);
+    } finally {
+      pendingByNpm.delete(key);
     }
   })();
 
