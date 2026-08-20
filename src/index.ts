@@ -141,7 +141,7 @@ async function main() {
   switch (command) {
     case 'positions':
     case 'read': {
-      const fetchSpinner = ora({
+      const spinner = ora({
         text: theme.muted(`Fetching LP positions for ${shortAddr(wallet)}…`),
         color: 'cyan',
       }).start();
@@ -150,24 +150,21 @@ async function main() {
       try {
         read = await getWalletUniswapPositions(input);
       } catch (err) {
-        fetchSpinner.fail(theme.error('Failed to fetch positions'));
+        spinner.fail(theme.error('Failed to fetch positions'));
         throw err;
       }
 
-      const valSpinner = ora({
-        text: theme.muted(`Valuating ${read.positions.length} positions…`),
-        color: 'cyan',
-      }).start();
+      spinner.text = theme.muted(`Valuating ${read.positions.length} positions…`);
 
       let valuation;
       try {
         valuation = await valuePositions(read.positions, read.chainId);
       } catch (err) {
-        valSpinner.fail(theme.error('Valuation failed'));
+        spinner.fail(theme.error('Valuation failed'));
         throw err;
       }
 
-      valSpinner.succeed(
+      spinner.succeed(
         theme.success(`Valued ${read.positions.length} positions at ${theme.value(formatUsd(valuation.totalUsd))}`),
       );
 
