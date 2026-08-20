@@ -1,25 +1,38 @@
 import { encodeAbiParameters, getAddress, keccak256, type Address, type PublicClient } from 'viem';
 import { z } from 'zod';
 
-import { BSC_CONFIG, ROBINHOOD_CHAIN, UNISWAP_CONTRACTS, type ChainName } from '../constants/chain.js';
+import {
+  BASE_CONFIG,
+  BSC_CONFIG,
+  ROBINHOOD_CHAIN,
+  UNISWAP_CONTRACTS,
+  type ChainName,
+} from '../constants/chain.js';
 import { env } from '../config/env.js';
+import { publicClientBase } from '../lib/base-public-client.js';
 import { publicClientBsc } from '../lib/bsc-public-client.js';
 import { getNftTransferHistory } from '../lib/bscscan.js';
 import { fetchJson } from '../lib/http.js';
 import { publicClient } from '../lib/public-client.js';
 import { loadNftAgeCache, saveNftAgeCache } from '../lib/storage.js';
+import { extractAlchemyKey, fetchAlchemyNftTokenIds } from '../lib/alchemy-nft.js';
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
-const BLOCKSCOUT_API_BASE = 'https://robinhoodchain.blockscout.com/api';
+const ROBINHOOD_BLOCKSCOUT_API_BASE = 'https://robinhoodchain.blockscout.com/api';
 const MAX_UINT128 = (2n ** 128n) - 1n;
 const MAX_UINT256 = (2n ** 256n) - 1n;
+
+function blockscoutApiBaseFor(chain: ChainName): string {
+  if (chain === 'base') return BASE_CONFIG.blockscoutApiBase;
+  return ROBINHOOD_BLOCKSCOUT_API_BASE;
+}
 
 export const walletInputSchema = z.object({
   wallet: z
     .string()
     .regex(/^0x[a-fA-F0-9]{40}$/, 'wallet must be a valid EVM address')
     .transform((value) => getAddress(value)),
-  chain: z.enum(['robinhood', 'bsc']).default('robinhood'),
+  chain: z.enum(['robinhood', 'bsc', 'base']).default('robinhood'),
   chainId: z.coerce.number().int().positive().optional(),
   protocol: z.enum(['all', 'v2', 'v3', 'v4']).default('all'),
 });
@@ -152,6 +165,9 @@ type BlockscoutV2TokenBalanceItem = {
 
 type BlockscoutV2NftInstanceItem = {
   id: string;
+  token?: {
+    address_hash?: string;
+  };
 };
 
 const erc20MetadataAbi = [
@@ -504,7 +520,9 @@ export async function getWalletUniswapPositions(input: unknown): Promise<WalletL
   const query = {
     ...raw,
     chain: raw.chain,
-    chainId: raw.chainId ?? (raw.chain === 'bsc' ? env.BSC_CHAIN_ID : ROBINHOOD_CHAIN.id),
+    chainId:
+      raw.chainId ??
+      (raw.chain === 'bsc' ? BSC_CONFIG.id : raw.chain === 'base' ? BASE_CONFIG.id : ROBINHOOD_CHAIN.id),
   };
 
   if (query.chain === 'robinhood' && query.chainId !== ROBINHOOD_CHAIN.id) {
@@ -516,6 +534,12 @@ export async function getWalletUniswapPositions(input: unknown): Promise<WalletL
   if (query.chain === 'bsc' && query.chainId !== BSC_CONFIG.id) {
     throw new Error(
       `Unsupported chainId ${query.chainId}. BSC path uses chain ${BSC_CONFIG.id}.`,
+    );
+  }
+
+  if (query.chain === 'base' && query.chainId !== BASE_CONFIG.id) {
+    throw new Error(
+      `Unsupported chainId ${query.chainId}. Base path uses chain ${BASE_CONFIG.id}.`,
     );
   }
 
@@ -531,9 +555,19 @@ export async function getWalletUniswapPositions(input: unknown): Promise<WalletL
 
   if (query.chain === 'robinhood') {
     [v2Positions, v3Uniswap, v4Positions] = await Promise.all([
-      includeV2 ? readV2Positions(owner) : Promise.resolve([]),
-      includeV3 ? readV3Positions(owner) : Promise.resolve([]),
-      includeV4 ? readV4Positions(owner) : Promise.resolve([]),
+      includeV2
+        ? readV2Positions(owner, publicClient, UNISWAP_CONTRACTS.v2Factory as Address, blockscoutApiBaseFor('robinhood'))
+        : Promise.resolve([]),
+      includeV3 ? readV3Positions(owner, publicClient, UNISWAP_CONTRACTS, blockscoutApiBaseFor('robinhood')) : Promise.resolve([]),
+      includeV4 ? readV4Positions(owner, publicClient, UNISWAP_CONTRACTS, blockscoutApiBaseFor('robinhood')) : Promise.resolve([]),
+    ]);
+  } else if (query.chain === 'base') {
+    [v2Positions, v3Uniswap, v4Positions] = await Promise.all([
+      includeV2
+        ? readV2Positions(owner, publicClientBase, BASE_CONFIG.uniswap.v2Factory as Address, blockscoutApiBaseFor('base'))
+        : Promise.resolve([]),
+      includeV3 ? readV3Positions(owner, publicClientBase, BASE_CONFIG.uniswap, blockscoutApiBaseFor('base')) : Promise.resolve([]),
+      includeV4 ? readV4Positions(owner, publicClientBase, BASE_CONFIG.uniswap, blockscoutApiBaseFor('base')) : Promise.resolve([]),
     ]);
   } else {
     [v3Pancake] = await Promise.all([
@@ -544,7 +578,7 @@ export async function getWalletUniswapPositions(input: unknown): Promise<WalletL
   const v3Positions: V3Position[] = [...v3Uniswap, ...v3Pancake];
   const positions: AnyPosition[] = [...v2Positions, ...v3Positions, ...v4Positions];
 
-  if (query.chain === 'robinhood') {
+  if (query.chain === 'robinhood' || query.chain === 'base') {
     flushNftAgeCache();
   }
 
@@ -566,29 +600,56 @@ export async function getWalletUniswapPositions(input: unknown): Promise<WalletL
       },
     },
     positions,
-    notes:
-      query.chain === 'robinhood'
-        ? [
-            'Uniswap v2 positions are identified from wallet-held ERC-20s and verified against Uniswap v2 factory.',
-            'Uniswap v3 positions include principal and uncollected fees via static simulation.',
-            'Uniswap v4 positions are discovered from Blockscout NFT transfer history, then verified by ownerOf.',
-            'v4 amounts, in-range status, and uncollected fees are read from the v4 StateView contract (pool slot0, position info, fee growth).',
-            'Run `track` to persist a snapshot and diff it against the previous one for PnL-style tracking.',
-          ]
-        : [
-            `Reading PancakeSwap v3 positions on ${BSC_CONFIG.name} (chain ${BSC_CONFIG.id}).`,
-            'Positions are discovered from the PancakeSwap v3 NonfungiblePositionManager (balanceOf / tokenOfOwnerByIndex).',
-            'Pool state (sqrtPriceX96, current tick) is read from each PancakeV3Pool via slot0.',
-            'Principal and uncollected fees are computed via static simulation of decreaseLiquidity / collect on the position manager.',
-            'NFT mint timestamps are fetched from BscScan (set BSCSCAN_API_KEY to lift the 5 req/s free-tier limit).',
-            'v2 and v4 positions are not read on BSC in this slice.',
-          ],
+    notes: buildReadNotes(query.chain, {
+      v2: v2Positions.length,
+      v3: v3Positions.length,
+      v4: v4Positions.length,
+    }),
   };
 }
 
-async function readV2Positions(owner: Address): Promise<V2Position[]> {
-  const tokens = await fetchWalletTokenList(owner);
-  const v2Factory = (UNISWAP_CONTRACTS.v2Factory as Address).toLowerCase();
+function buildReadNotes(
+  chain: ChainName,
+  counts: { v2: number; v3: number; v4: number },
+): string[] {
+  if (chain === 'robinhood') {
+    return [
+      'Uniswap v2 positions are identified from wallet-held ERC-20s and verified against Uniswap v2 factory.',
+      'Uniswap v3 positions include principal and uncollected fees via static simulation.',
+      'Uniswap v4 positions are discovered from Blockscout NFT transfer history, then verified by ownerOf.',
+      'v4 amounts, in-range status, and uncollected fees are read from the v4 StateView contract (pool slot0, position info, fee growth).',
+      'Run `track` to persist a snapshot and diff it against the previous one for PnL-style tracking.',
+    ];
+  }
+
+  if (chain === 'base') {
+    return [
+      `Reading Uniswap v2/v3/v4 positions on ${BASE_CONFIG.name} (chain ${BASE_CONFIG.id}).`,
+      'Uniswap v2 positions are identified from wallet-held ERC-20s (Base Blockscout) and verified against the Uniswap v2 factory.',
+      'Uniswap v3 positions are read via the Uniswap v3 NonfungiblePositionManager; principal and uncollected fees come from static simulation of decreaseLiquidity / collect.',
+      'Uniswap v4 positions are discovered from Base Blockscout NFT transfer history, then verified by ownerOf.',
+      'v4 amounts, in-range status, and uncollected fees are read from the v4 StateView contract (pool slot0, position info, fee growth).',
+    ];
+  }
+
+  return [
+    `Reading PancakeSwap v3 positions on ${BSC_CONFIG.name} (chain ${BSC_CONFIG.id}).`,
+    'Positions are discovered from the PancakeSwap v3 NonfungiblePositionManager (balanceOf / tokenOfOwnerByIndex).',
+    'Pool state (sqrtPriceX96, current tick) is read from each PancakeV3Pool via slot0.',
+    'Principal and uncollected fees are computed via static simulation of decreaseLiquidity / collect on the position manager.',
+    'NFT mint timestamps are fetched from BscScan (set BSCSCAN_API_KEY to lift the 5 req/s free-tier limit).',
+    'v2 and v4 positions are not read on BSC in this slice.',
+  ];
+}
+
+async function readV2Positions(
+  owner: Address,
+  client: PublicClient,
+  v2FactoryAddress: Address,
+  blockscoutApiBase: string = ROBINHOOD_BLOCKSCOUT_API_BASE,
+): Promise<V2Position[]> {
+  const tokens = await fetchWalletTokenList(owner, blockscoutApiBase);
+  const v2Factory = v2FactoryAddress.toLowerCase();
 
   const candidates = tokens
     .filter((token) => token.type === 'ERC-20' && parseBigInt(token.balance) > 0n)
@@ -607,7 +668,7 @@ async function readV2Positions(owner: Address): Promise<V2Position[]> {
     { address: pairAddress, abi: v2PairAbi, functionName: 'totalSupply' },
   ] as MulticallCall[]);
 
-  const pairResults = await multicallReads<unknown>(pairCalls);
+  const pairResults = await multicallReadsOn<unknown>(client, pairCalls);
 
   const tokenAddresses = candidates.flatMap((_, index) => {
     const token0 = pairResults[index * 5 + 1];
@@ -617,7 +678,7 @@ async function readV2Positions(owner: Address): Promise<V2Position[]> {
     if (typeof token1 === 'string') result.push(getAddress(token1));
     return result;
   });
-  await prefetchTokenMetadata(tokenAddresses);
+  await prefetchTokenMetadataOn(client, tokenAddresses);
 
   const positions = await mapInBatches(candidates, 16, async ({ token, pairAddress }, index) => {
     const offset = index * 5;
@@ -645,9 +706,9 @@ async function readV2Positions(owner: Address): Promise<V2Position[]> {
     const lpBalance = parseBigInt(token.balance);
 
     const [token0Meta, token1Meta, createdAt] = await Promise.all([
-      getTokenMetadata(token0Address),
-      getTokenMetadata(token1Address),
-      fetchV2PairCreatedAt(pairAddress),
+      getTokenMetadataOn(client, token0Address),
+      getTokenMetadataOn(client, token1Address),
+      fetchV2PairCreatedAt(pairAddress, blockscoutApiBase),
     ]);
 
     const principal0Raw = (reserves[0] * lpBalance) / totalSupply;
@@ -675,18 +736,31 @@ async function readV2Positions(owner: Address): Promise<V2Position[]> {
   return positions.filter((item): item is V2Position => item !== null);
 }
 
-async function readV3Positions(owner: Address): Promise<V3Position[]> {
-  const positionManager = UNISWAP_CONTRACTS.v3NonfungiblePositionManager as Address;
-  const v3Factory = UNISWAP_CONTRACTS.v3Factory as Address;
+type UniswapContractSet = {
+  v3Factory: string;
+  v3NonfungiblePositionManager: string;
+  v4PoolManager: string;
+  v4PositionManager: string;
+  v4StateView: string;
+};
+
+async function readV3Positions(
+  owner: Address,
+  client: PublicClient,
+  contracts: UniswapContractSet,
+  blockscoutApiBase: string = ROBINHOOD_BLOCKSCOUT_API_BASE,
+): Promise<V3Position[]> {
+  const positionManager = contracts.v3NonfungiblePositionManager as Address;
+  const v3Factory = contracts.v3Factory as Address;
 
   return readV3LikePositions({
     owner,
-    client: publicClient,
+    client,
     positionManager,
     factory: v3Factory,
     npmAbi: v3NpmAbi,
     provider: 'uniswap',
-    fetchCreatedAt: (tokenId) => fetchNftCreatedAt(positionManager, tokenId),
+    fetchCreatedAt: (tokenId) => fetchNftCreatedAt(positionManager, tokenId, blockscoutApiBase),
   });
 }
 
@@ -802,8 +876,8 @@ async function readV3LikePositions(args: {
     const slot0 = slot0Results[index];
     if (!slot0) return null;
 
-    const token0Meta = await getTokenMetadata(position.token0Address);
-    const token1Meta = await getTokenMetadata(position.token1Address);
+    const token0Meta = await getTokenMetadataOn(client, position.token0Address);
+    const token1Meta = await getTokenMetadataOn(client, position.token1Address);
     const createdAt = await fetchCreatedAt(position.tokenId);
     const simulatedCollect = await safeSimulateCollect(client, positionManager, owner, position.tokenId, npmAbi);
     const simulatedDecrease =
@@ -845,14 +919,20 @@ async function readV3LikePositions(args: {
 
 type V3Slot0 = readonly [bigint, number, number, number, number, number, boolean];
 
-async function readV4Positions(owner: Address): Promise<V4Position[]> {
-  const positionManager = UNISWAP_CONTRACTS.v4PositionManager as Address;
-  const stateView = UNISWAP_CONTRACTS.v4StateView as Address;
+async function readV4Positions(
+  owner: Address,
+  client: PublicClient,
+  contracts: UniswapContractSet,
+  blockscoutApiBase: string,
+): Promise<V4Position[]> {
+  const positionManager = contracts.v4PositionManager as Address;
+  const stateView = contracts.v4StateView as Address;
 
-  const tokenIds = await fetchWalletNftTokenIds(owner, positionManager);
+  const tokenIds = await fetchWalletNftTokenIds(owner, positionManager, blockscoutApiBase);
   if (tokenIds.length === 0) return [];
 
-  const ownerResults = await multicallReads<Address>(
+  const ownerResults = await multicallReadsOn<Address>(
+    client,
     tokenIds.map((tokenId) => ({
       address: positionManager,
       abi: erc721OwnerOfAbi,
@@ -866,9 +946,10 @@ async function readV4Positions(owner: Address): Promise<V4Position[]> {
   );
   if (ownedTokenIds.length === 0) return [];
 
-  const poolInfoResults = await multicallReads<
+  const poolInfoResults = await multicallReadsOn<
     readonly [V4PoolKeyResult, bigint]
   >(
+    client,
     ownedTokenIds.map((tokenId) => ({
       address: positionManager,
       abi: v4PositionManagerAbi,
@@ -919,7 +1000,8 @@ async function readV4Positions(owner: Address): Promise<V4Position[]> {
   );
 
   const [slot0Results, posInfoResults, feeGrowthResults, createdAts] = await Promise.all([
-    multicallReads<V4Slot0>(
+    multicallReadsOn<V4Slot0>(
+      client,
       valid.map((item) => ({
         address: stateView,
         abi: v4StateViewAbi,
@@ -927,7 +1009,8 @@ async function readV4Positions(owner: Address): Promise<V4Position[]> {
         args: [item.poolId],
       })),
     ),
-    multicallReads<V4PositionInfo>(
+    multicallReadsOn<V4PositionInfo>(
+      client,
       valid.map((item) => ({
         address: stateView,
         abi: v4StateViewAbi,
@@ -935,7 +1018,8 @@ async function readV4Positions(owner: Address): Promise<V4Position[]> {
         args: [item.poolId, positionManager, item.tickLower, item.tickUpper, item.salt],
       })),
     ),
-    multicallReads<V4FeeGrowthInside>(
+    multicallReadsOn<V4FeeGrowthInside>(
+      client,
       valid.map((item) => ({
         address: stateView,
         abi: v4StateViewAbi,
@@ -943,11 +1027,13 @@ async function readV4Positions(owner: Address): Promise<V4Position[]> {
         args: [item.poolId, item.tickLower, item.tickUpper],
       })),
     ),
-    mapInBatches(ownedTokenIds, 40, (tokenId) => fetchNftCreatedAt(positionManager, tokenId)),
+    mapInBatches(ownedTokenIds, 40, (tokenId) =>
+      fetchNftCreatedAt(positionManager, tokenId, blockscoutApiBase),
+    ),
   ]);
 
   const tokenAddresses = valid.flatMap((item) => [item.poolKey.currency0, item.poolKey.currency1]);
-  await prefetchTokenMetadata(tokenAddresses);
+  await prefetchTokenMetadataOn(client, tokenAddresses);
 
   const validPositions = await mapInBatches(valid, 16, async (item, index) => {
     const slot0 = slot0Results[index];
@@ -999,8 +1085,8 @@ async function readV4Positions(owner: Address): Promise<V4Position[]> {
       liquidity,
     );
 
-    const token0Meta = await getTokenMetadata(item.poolKey.currency0);
-    const token1Meta = await getTokenMetadata(item.poolKey.currency1);
+    const token0Meta = await getTokenMetadataOn(client, item.poolKey.currency0);
+    const token1Meta = await getTokenMetadataOn(client, item.poolKey.currency1);
 
     return {
       protocol: 'v4',
@@ -1264,12 +1350,26 @@ function signed24(raw: number): number {
   return raw >= 0x800000 ? raw - 0x1000000 : raw;
 }
 
-async function fetchWalletTokenList(owner: Address): Promise<BlockscoutTokenItem[]> {
+async function fetchWalletTokenList(
+  owner: Address,
+  blockscoutApiBase: string = ROBINHOOD_BLOCKSCOUT_API_BASE,
+): Promise<BlockscoutTokenItem[]> {
+  try {
+    return await fetchWalletTokenListV2(owner, blockscoutApiBase);
+  } catch {
+    return await fetchWalletTokenListLegacy(owner, blockscoutApiBase);
+  }
+}
+
+async function fetchWalletTokenListV2(
+  owner: Address,
+  blockscoutApiBase: string,
+): Promise<BlockscoutTokenItem[]> {
   const items: BlockscoutTokenItem[] = [];
   let pageParams: BlockscoutV2PageParams | null = { type: 'ERC-20' };
 
   while (pageParams) {
-    const url = new URL(`${BLOCKSCOUT_API_BASE}/v2/addresses/${owner.toLowerCase()}/tokens`);
+    const url = new URL(`${blockscoutApiBase}/v2/addresses/${owner.toLowerCase()}/tokens`);
     for (const [key, value] of Object.entries(pageParams)) {
       if (value !== null && value !== '') url.searchParams.set(key, String(value));
     }
@@ -1295,28 +1395,131 @@ async function fetchWalletTokenList(owner: Address): Promise<BlockscoutTokenItem
   return items;
 }
 
-async function fetchWalletNftTokenIds(owner: Address, contractAddress: Address): Promise<bigint[]> {
+async function fetchWalletTokenListLegacy(
+  owner: Address,
+  blockscoutApiBase: string,
+): Promise<BlockscoutTokenItem[]> {
+  type LegacyToken = {
+    balance: string;
+    contractAddress: string;
+    decimals: string;
+    name: string;
+    symbol: string;
+    type: string;
+  };
+
+  type LegacyResponse = {
+    status?: string;
+    message?: string;
+    result?: LegacyToken[];
+  };
+
+  const url = `${blockscoutApiBase}/api?module=account&action=tokenlist&address=${owner.toLowerCase()}`;
+  const data = await fetchJson<LegacyResponse>(url);
+  if (!Array.isArray(data.result)) return [];
+
+  return data.result.map((item) => ({
+    balance: item.balance,
+    contractAddress: item.contractAddress,
+    decimals: item.decimals ?? '0',
+    name: item.name ?? '',
+    symbol: item.symbol ?? '',
+    type: item.type ?? 'ERC-20',
+  }));
+}
+
+async function fetchWalletNftTokenIds(
+  owner: Address,
+  contractAddress: Address,
+  blockscoutApiBase: string = ROBINHOOD_BLOCKSCOUT_API_BASE,
+): Promise<bigint[]> {
+  const alchemyKey = extractAlchemyKey(env.BASE_RPC_URL) ?? extractAlchemyKey(env.RH_RPC_URL);
+  if (alchemyKey) {
+    try {
+      const fromAlchemy = await fetchAlchemyNftTokenIds(owner, contractAddress, { apiKey: alchemyKey });
+      if (fromAlchemy.length > 0) return fromAlchemy;
+    } catch {
+      // fall through to Blockscout
+    }
+  }
+
   const collected = new Set<bigint>();
-  let pageParams: BlockscoutV2PageParams | null = { holder_address_hash: owner };
+  const target = contractAddress.toLowerCase();
+  let pageParams: BlockscoutV2PageParams | null = { type: 'ERC-721' };
 
   while (pageParams) {
     const url = new URL(
-      `${BLOCKSCOUT_API_BASE}/v2/tokens/${contractAddress.toLowerCase()}/instances`,
+      `${blockscoutApiBase}/v2/addresses/${owner.toLowerCase()}/nft`,
     );
     for (const [key, value] of Object.entries(pageParams)) {
       if (value !== null && value !== '') url.searchParams.set(key, String(value));
     }
 
-    const data = await fetchJson<BlockscoutV2ListResponse<BlockscoutV2NftInstanceItem>>(
-      url.toString(),
+    try {
+      const data = await fetchJson<BlockscoutV2ListResponse<BlockscoutV2NftInstanceItem>>(
+        url.toString(),
+      );
+
+      for (const item of data.items) {
+        const itemAddress = (item.token?.address_hash ?? '').toLowerCase();
+        if (itemAddress !== target) continue;
+        const tokenId = parseBigInt(item.id);
+        if (tokenId > 0n) collected.add(tokenId);
+      }
+
+      pageParams = data.next_page_params;
+    } catch {
+      // If wallet NFT endpoint 500s (common on Base Blockscout for busy wallets),
+      // fall back to paginating every instance of the contract and filtering by owner.
+      return await fetchWalletNftTokenIdsByInstanceScan(
+        owner,
+        contractAddress,
+        blockscoutApiBase,
+      );
+    }
+  }
+
+  if (collected.size === 0) {
+    return await fetchWalletNftTokenIdsByInstanceScan(
+      owner,
+      contractAddress,
+      blockscoutApiBase,
     );
+  }
+
+  return [...collected];
+}
+
+async function fetchWalletNftTokenIdsByInstanceScan(
+  owner: Address,
+  contractAddress: Address,
+  blockscoutApiBase: string,
+): Promise<bigint[]> {
+  const collected = new Set<bigint>();
+  const targetOwner = owner.toLowerCase();
+  const totalCalls = contractAddress.toLowerCase() === BASE_CONFIG.uniswap.v4PositionManager.toLowerCase() ? 80 : 50;
+  let pageParams: BlockscoutV2PageParams | null = null;
+
+  for (let page = 0; page < totalCalls && (page === 0 || pageParams); page++) {
+    const url = new URL(
+      `${blockscoutApiBase}/v2/tokens/${contractAddress.toLowerCase()}/instances`,
+    );
+    for (const [key, value] of Object.entries(pageParams ?? {})) {
+      if (value !== null && value !== '') url.searchParams.set(key, String(value));
+    }
+
+    type InstanceItem = { id: string; owner?: { hash?: string } | null };
+    const data = await fetchJson<BlockscoutV2ListResponse<InstanceItem>>(url.toString());
 
     for (const item of data.items) {
+      const ownerHash = (item.owner?.hash ?? '').toLowerCase();
+      if (ownerHash !== targetOwner) continue;
       const tokenId = parseBigInt(item.id);
       if (tokenId > 0n) collected.add(tokenId);
     }
 
     pageParams = data.next_page_params;
+    if (collected.size > 0 && page >= 4) break;
   }
 
   return [...collected];
@@ -1340,7 +1543,11 @@ function flushNftAgeCache(): void {
   }
 }
 
-async function fetchNftCreatedAt(contractAddress: Address, tokenId: bigint): Promise<string | null> {
+async function fetchNftCreatedAt(
+  contractAddress: Address,
+  tokenId: bigint,
+  blockscoutApiBase: string = ROBINHOOD_BLOCKSCOUT_API_BASE,
+): Promise<string | null> {
   const cacheKey = `${contractAddress.toLowerCase()}:${tokenId.toString()}`;
   const cached = nftCreatedAtCache.get(cacheKey);
   if (cached) return cached;
@@ -1359,7 +1566,7 @@ async function fetchNftCreatedAt(contractAddress: Address, tokenId: bigint): Pro
     try {
       for (let page = 0; page < 50 && (page === 0 || pageParams); page++) {
         const url = new URL(
-          `${BLOCKSCOUT_API_BASE}/v2/tokens/${contractAddress.toLowerCase()}/instances/${tokenId.toString()}/transfers`,
+          `${blockscoutApiBase}/v2/tokens/${contractAddress.toLowerCase()}/instances/${tokenId.toString()}/transfers`,
         );
         for (const [key, value] of Object.entries(pageParams ?? {})) {
           if (value !== null && value !== '') url.searchParams.set(key, String(value));
@@ -1399,7 +1606,10 @@ async function fetchNftCreatedAt(contractAddress: Address, tokenId: bigint): Pro
 
 const v2CreatedAtCache = new Map<string, Promise<string | null>>();
 
-async function fetchV2PairCreatedAt(pairAddress: Address): Promise<string | null> {
+async function fetchV2PairCreatedAt(
+  pairAddress: Address,
+  blockscoutApiBase: string = ROBINHOOD_BLOCKSCOUT_API_BASE,
+): Promise<string | null> {
   const cacheKey = pairAddress.toLowerCase();
   const cached = v2CreatedAtCache.get(cacheKey);
   if (cached) return cached;
@@ -1407,14 +1617,14 @@ async function fetchV2PairCreatedAt(pairAddress: Address): Promise<string | null
   const promise = (async () => {
     try {
       const address = await fetchJson<{ creation_transaction_hash?: string | null }>(
-        `${BLOCKSCOUT_API_BASE}/v2/addresses/${pairAddress.toLowerCase()}`,
+        `${blockscoutApiBase}/v2/addresses/${pairAddress.toLowerCase()}`,
       );
 
       const creationTx = address.creation_transaction_hash;
       if (!creationTx) return null;
 
       const tx = await fetchJson<{ timestamp?: string | null }>(
-        `${BLOCKSCOUT_API_BASE}/v2/transactions/${creationTx}`,
+        `${blockscoutApiBase}/v2/transactions/${creationTx}`,
       );
       return tx.timestamp ?? null;
     } catch {
@@ -1426,8 +1636,9 @@ async function fetchV2PairCreatedAt(pairAddress: Address): Promise<string | null
   return promise;
 }
 
-async function getTokenMetadata(address: Address): Promise<TokenMetadata> {
+async function getTokenMetadataOn(client: PublicClient, address: Address): Promise<TokenMetadata> {
   const normalized = getAddress(address);
+  const chainId = client.chain?.id ?? 0;
 
   if (normalized.toLowerCase() === ZERO_ADDRESS) {
     return {
@@ -1437,14 +1648,14 @@ async function getTokenMetadata(address: Address): Promise<TokenMetadata> {
     };
   }
 
-  const cacheKey = normalized.toLowerCase();
+  const cacheKey = `${chainId}:${normalized.toLowerCase()}`;
   const cached = tokenMetadataCache.get(cacheKey);
   if (cached) return cached;
 
   const promise = (async () => {
     const [symbol, decimals] = await Promise.all([
-      safeReadSymbol(normalized, `${normalized.slice(0, 6)}...`),
-      safeReadDecimals(normalized, 18),
+      safeReadSymbol(client, normalized, `${normalized.slice(0, 6)}...`),
+      safeReadDecimals(client, normalized, 18),
     ]);
 
     return {
@@ -1458,10 +1669,18 @@ async function getTokenMetadata(address: Address): Promise<TokenMetadata> {
   return promise;
 }
 
-async function safeReadSymbol(address: Address, fallback: string): Promise<string> {
+async function getTokenMetadata(address: Address): Promise<TokenMetadata> {
+  return getTokenMetadataOn(publicClient, address);
+}
+
+async function safeReadSymbol(
+  client: PublicClient,
+  address: Address,
+  fallback: string,
+): Promise<string> {
   try {
     const symbol = await withRetries(() =>
-      publicClient.readContract({
+      client.readContract({
         address,
         abi: erc20MetadataAbi,
         functionName: 'symbol',
@@ -1475,10 +1694,14 @@ async function safeReadSymbol(address: Address, fallback: string): Promise<strin
   }
 }
 
-async function safeReadDecimals(address: Address, fallback: number): Promise<number> {
+async function safeReadDecimals(
+  client: PublicClient,
+  address: Address,
+  fallback: number,
+): Promise<number> {
   try {
     const decimals = await withRetries(() =>
-      publicClient.readContract({
+      client.readContract({
         address,
         abi: erc20MetadataAbi,
         functionName: 'decimals',
@@ -1600,8 +1823,9 @@ async function prefetchTokenMetadataOn(
   client: PublicClient,
   addresses: readonly Address[],
 ): Promise<void> {
+  const chainId = client.chain?.id ?? 0;
   const unique = [...new Set(addresses.map((address) => getAddress(address).toLowerCase() as Address))];
-  const missing = unique.filter((address) => !tokenMetadataCache.has(address));
+  const missing = unique.filter((address) => !tokenMetadataCache.has(`${chainId}:${address}`));
   if (missing.length === 0) return;
 
   const calls: MulticallCall[] = [];
@@ -1618,7 +1842,7 @@ async function prefetchTokenMetadataOn(
     const decimals = results[i * 2 + 1];
 
     tokenMetadataCache.set(
-      address,
+      `${chainId}:${address}`,
       Promise.resolve({
         address,
         symbol: typeof symbol === 'string' && symbol.trim().length > 0 ? symbol : `${address.slice(0, 6)}...`,

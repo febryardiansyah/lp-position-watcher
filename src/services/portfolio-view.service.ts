@@ -250,5 +250,6 @@ function trimAmount(value: string): string {
 
 function chainLabel(read: WalletLpReadResult): string {
   if (read.chainName === 'bsc') return `BNB Smart Chain (${read.chainId})`;
+  if (read.chainName === 'base') return `Base (${read.chainId})`;
   return `Robinhood Chain (${read.chainId})`;
 }

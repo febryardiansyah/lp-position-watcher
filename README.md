@@ -4,6 +4,7 @@ A CLI tool that reads a wallet's LP positions and displays them in a portfolio v
 
 - **Robinhood Chain** (chain 4663, default): Uniswap v2 / v3 / v4 LP positions.
 - **BNB Smart Chain** (chain 56, opt-in via `--chain bsc`): PancakeSwap v3 LP positions.
+- **Base** (chain 8453, opt-in via `--chain base`): Uniswap v2 / v3 / v4 LP positions.
 
 ## Features
 
@@ -43,6 +44,8 @@ Edit `.env`:
 | `BSC_RPC_URL` | Optional BSC RPC override | (public fallbacks) |
 | `BSC_CHAIN_ID` | BSC chain ID | `56` |
 | `BSCSCAN_API_KEY` | Optional BscScan API key (5 req/s free, 100 req/s with key) | empty |
+| `BASE_RPC_URL` | Optional Base RPC override | (public fallbacks) |
+| `BASE_CHAIN_ID` | Base chain ID | `8453` |
 | `WALLET_ADDRESS` | Optional default wallet address | empty |
 
 > Robinhood Chain runs use free public RPCs + Blockscout, no API keys required. BSC runs need a public RPC (built-in fallbacks include `bsc-rpc.publicnode.com`, `1rpc.io/bnb`, `bsc-dataseed.binance.org`) and optionally a BscScan API key to lift the 5 req/s limit on NFT history lookups.
@@ -57,10 +60,11 @@ npm run dev -- track <walletAddress>      Record a valuation snapshot and report
 npm run dev -- history <walletAddress>    List recorded snapshots for a wallet
 npm run dev -- diff <walletAddress>       Diff the two most recent snapshots
 npm run dev -- --chain bsc <wallet>       Read PancakeSwap v3 on BNB Smart Chain
+npm run dev -- --chain base <wallet>      Read Uniswap v2/v3/v4 on Base
 npm run dev -- help                       Show help
 ```
 
-Append `--chain robinhood` (default) or `--chain bsc` to any of the above to switch chains.
+Append `--chain robinhood` (default), `--chain bsc`, or `--chain base` to any of the above to switch chains.
 
 ### Pagination
 
@@ -145,11 +149,12 @@ Snapshots are stored as JSON files under `RH_DATA_DIR` (one file per wallet).
 src/
 ├── index.ts                       CLI entry point (arg parsing, command dispatch)
 ├── config/env.ts                  Environment validation (zod)
-├── constants/chain.ts             Chain + contract addresses (RH + BSC)
+├── constants/chain.ts             Chain + contract addresses (RH / BSC / Base)
 ├── lib/
 │   ├── http.ts                    Fetch with retries/backoff
 │   ├── public-client.ts           Viem public client for Robinhood Chain
 │   ├── bsc-public-client.ts       Viem public client for BNB Smart Chain
+│   ├── base-public-client.ts      Viem public client for Base
 │   ├── bscscan.ts                 BscScan API client (NFT transfer history)
 │   └── storage.ts                 Snapshot persistence (JSON files)
 └── services/
@@ -161,8 +166,8 @@ src/
 
 ### Data sources
 
-- **RPC** — on-chain contract calls (Uniswap v2/v3/v4 on Robinhood Chain, PancakeSwap v3 on BSC, v4 `StateView`)
-- **Blockscout** (`robinhoodchain.blockscout.com`) — wallet token holdings, NFT transfer history (position age), chain coin price, token `exchange_rate` fallback (Robinhood Chain only)
+- **RPC** — on-chain contract calls (Uniswap v2/v3/v4 on Robinhood Chain and Base, PancakeSwap v3 on BSC, v4 `StateView`)
+- **Blockscout** — `robinhoodchain.blockscout.com` (Robinhood) and `base.blockscout.com` (Base): wallet token holdings, NFT transfer history (position age), and `exchange_rate` token pricing fallback (Robinhood only)
 - **BscScan** (`api.bscscan.com`) — PancakeSwap v3 NFT transfer history (mint timestamp) (BSC only)
 - **DexScreener** (`api.dexscreener.com`) — market USD prices, taken from the highest-liquidity pool on the active chain per token (free, no API key)
 - Price resolution order: DexScreener market price → Blockscout `exchange_rate` (Robinhood only) → pool spot ratio (last resort)

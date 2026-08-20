@@ -13,14 +13,24 @@ import {
 } from './services/tracker.service.js';
 import { formatUsd, valuePositions } from './services/valuation.service.js';
 
-function rpcHints(errorMessage: string): string[] {
+function rpcHints(errorMessage: string, chain: 'robinhood' | 'bsc' | 'base'): string[] {
   const hints: string[] = [];
   const lower = errorMessage.toLowerCase();
 
   if (lower.includes('certificate') || lower.includes('ssl') || lower.includes('fetch failed')) {
-    hints.push(
-      'The RPC endpoint is unreachable from this network. Point RH_RPC_URL at another RPC endpoint in .env.',
-    );
+    if (chain === 'bsc') {
+      hints.push(
+        'The BSC RPC endpoint is unreachable from this network. Point BSC_RPC_URL at another BSC RPC in .env.',
+      );
+    } else if (chain === 'base') {
+      hints.push(
+        'The Base RPC endpoint is unreachable from this network. Point BASE_RPC_URL at another Base RPC in .env.',
+      );
+    } else {
+      hints.push(
+        'The RPC endpoint is unreachable from this network. Point RH_RPC_URL at another RPC endpoint in .env.',
+      );
+    }
   }
 
   return hints;
@@ -36,8 +46,9 @@ const USAGE = `Usage:
   npm run dev -- help                       Show this help
 
 Chain selection:
-  --chain <robinhood|bsc>   Which chain to read (default: robinhood).
-                             'bsc' reads PancakeSwap v3 positions on BNB Smart Chain.
+  --chain <robinhood|bsc|base>   Which chain to read (default: robinhood).
+                                 'bsc' reads PancakeSwap v3 on BNB Smart Chain.
+                                 'base' reads Uniswap v2/v3/v4 on Base (chain 8453).
 
 Pagination options (portfolio view):
   --limit <n>   Max closed positions per page (default 15)
@@ -61,6 +72,8 @@ function resolveWallet(walletArg: string | undefined): string {
   return getAddress(walletInput);
 }
 
+let currentChain: 'robinhood' | 'bsc' | 'base' = 'robinhood';
+
 async function main() {
   const args = process.argv.slice(2);
   const jsonIndex = args.indexOf('--json');
@@ -78,10 +91,13 @@ async function main() {
   const chainIndex = args.indexOf('--chain');
   const chainRaw = chainIndex !== -1 && args[chainIndex + 1] ? args[chainIndex + 1] : undefined;
   if (chainIndex !== -1) args.splice(chainIndex, 2);
-  const chain: 'robinhood' | 'bsc' =
-    chainRaw === 'bsc' ? 'bsc' : chainRaw === 'robinhood' || chainRaw === undefined ? 'robinhood' : (() => {
-      throw new Error(`Unknown --chain value "${chainRaw}". Use 'robinhood' or 'bsc'.`);
-    })();
+  const chain: 'robinhood' | 'bsc' | 'base' =
+    chainRaw === 'bsc' || chainRaw === 'base' || chainRaw === 'robinhood' || chainRaw === undefined
+      ? (chainRaw ?? 'robinhood')
+      : (() => {
+          throw new Error(`Unknown --chain value "${chainRaw}". Use 'robinhood', 'bsc', or 'base'.`);
+        })();
+  currentChain = chain;
 
   const first = args[0];
 
@@ -99,7 +115,12 @@ async function main() {
     protocol: 'all' as const,
     wallet,
     chain,
-    chainId: chain === 'bsc' ? env.BSC_CHAIN_ID : env.RH_CHAIN_ID,
+    chainId:
+      chain === 'bsc'
+        ? env.BSC_CHAIN_ID
+        : chain === 'base'
+          ? env.BASE_CHAIN_ID
+          : env.RH_CHAIN_ID,
   };
 
   switch (command) {
@@ -199,7 +220,7 @@ main().catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
   console.error(message);
 
-  const hints = rpcHints(message);
+  const hints = rpcHints(message, currentChain);
   if (hints.length > 0) {
     console.error('\nHints:');
     for (const hint of hints) {

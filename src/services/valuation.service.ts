@@ -1,6 +1,6 @@
 import { getAddress, type Address } from 'viem';
 
-import { BSC_CONFIG, ROBINHOOD_CHAIN } from '../constants/chain.js';
+import { BASE_CONFIG, BSC_CONFIG, ROBINHOOD_CHAIN } from '../constants/chain.js';
 import { fetchJson } from '../lib/http.js';
 import type { AnyPosition, TokenMetadata } from './lp-position.service.js';
 
@@ -38,7 +38,7 @@ type ChainContext = {
   wrappedAddress: string;
 };
 
-const CHAIN_CONTEXTS: Record<'robinhood' | 'bsc', ChainContext> = {
+const CHAIN_CONTEXTS: Record<'robinhood' | 'bsc' | 'base', ChainContext> = {
   robinhood: {
     chainId: ROBINHOOD_CHAIN.id,
     dexscreenerChainId: 'robinhood',
@@ -51,7 +51,19 @@ const CHAIN_CONTEXTS: Record<'robinhood' | 'bsc', ChainContext> = {
     nativeSymbol: 'BNB',
     wrappedAddress: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',
   },
+  base: {
+    chainId: BASE_CONFIG.id,
+    dexscreenerChainId: BASE_CONFIG.dexscreenerChainId,
+    nativeSymbol: 'ETH',
+    wrappedAddress: BASE_CONFIG.wrappedAddress,
+  },
 };
+
+function chainContextFor(chainId: number): ChainContext {
+  if (chainId === BSC_CONFIG.id) return CHAIN_CONTEXTS.bsc;
+  if (chainId === BASE_CONFIG.id) return CHAIN_CONTEXTS.base;
+  return CHAIN_CONTEXTS.robinhood;
+}
 
 const priceCache = new Map<string, Promise<number | null>>();
 const poolPriceCache = new Map<string, Promise<PairUsdPrices>>();
@@ -69,7 +81,7 @@ export function isWrappedBnb(token: string): boolean {
 
 export function isNativeTokenForChain(token: string, chainId: number): boolean {
   const normalized = getAddress(token).toLowerCase();
-  if (chainId === ROBINHOOD_CHAIN.id) return isEthToken(normalized);
+  if (chainId === ROBINHOOD_CHAIN.id || chainId === BASE_CONFIG.id) return isEthToken(normalized);
   if (chainId === BSC_CONFIG.id) return normalized === ZERO_ADDRESS || isWrappedBnb(normalized);
   return false;
 }
@@ -84,6 +96,13 @@ const STABLECOIN_ADDRESSES_BSC = new Set<string>([
   '0x14016e85a25aeb130656ee3f5d597cefcc921692', // EUROC
 ]);
 
+const STABLECOIN_ADDRESSES_BASE = new Set<string>([
+  '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', // USDC (native)
+  '0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca', // USDbC (USDC.e bridged)
+  '0xfde4c96c8593536e31f229ea8f37b2ada2699bb2', // USDT
+  '0x50c5725949a6f0c72e6c4a641f24049a917db0cb', // DAI
+]);
+
 export function isUsdStablecoin(token: string, chainId: number): boolean {
   const normalized = getAddress(token).toLowerCase();
   if (chainId === ROBINHOOD_CHAIN.id) {
@@ -91,6 +110,7 @@ export function isUsdStablecoin(token: string, chainId: number): boolean {
       || normalized === '0x6dcb1d9b6b4d13683dd3ee10b27ae3d6f4b4c4cd'; // USDC on RH
   }
   if (chainId === BSC_CONFIG.id) return STABLECOIN_ADDRESSES_BSC.has(normalized);
+  if (chainId === BASE_CONFIG.id) return STABLECOIN_ADDRESSES_BASE.has(normalized);
   return false;
 }
 
@@ -99,7 +119,7 @@ export function getNativeUsdPrice(chainId: number): Promise<number | null> {
   if (cached) return cached;
 
   const promise = (async () => {
-    const ctx = chainId === BSC_CONFIG.id ? CHAIN_CONTEXTS.bsc : CHAIN_CONTEXTS.robinhood;
+    const ctx = chainContextFor(chainId);
     try {
       if (ctx.chainId === ROBINHOOD_CHAIN.id) {
         const data = await fetchJson<BlockscoutStatsResponse>(`${BLOCKSCOUT_API_BASE}/v2/stats`);
@@ -174,7 +194,7 @@ export function getPoolUsdPrices(
   token0: Address,
   token1: Address,
 ): Promise<PairUsdPrices> {
-  const ctx = chainId === BSC_CONFIG.id ? CHAIN_CONTEXTS.bsc : CHAIN_CONTEXTS.robinhood;
+  const ctx = chainContextFor(chainId);
   const cacheKey = `pool:${chainId}:${pairAddress.toLowerCase()}`;
   const cached = poolPriceCache.get(cacheKey);
   if (cached) return cached;
@@ -227,7 +247,7 @@ export function getPoolUsdPrices(
 }
 
 export function getUsdPrice(token: Address, chainId: number = ROBINHOOD_CHAIN.id): Promise<number | null> {
-  const ctx = chainId === BSC_CONFIG.id ? CHAIN_CONTEXTS.bsc : CHAIN_CONTEXTS.robinhood;
+  const ctx = chainContextFor(chainId);
   const normalized = getAddress(token).toLowerCase();
   const cacheKey = `${chainId}:${normalized}`;
   const cached = priceCache.get(cacheKey);

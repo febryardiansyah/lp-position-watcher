@@ -1,5 +1,7 @@
 import { getAddress, type Address } from 'viem';
 
+import { publicClientBase } from '../lib/base-public-client.js';
+import { publicClientBsc } from '../lib/bsc-public-client.js';
 import { publicClient } from '../lib/public-client.js';
 import {
   appendSnapshot,
@@ -14,6 +16,19 @@ import {
   walletInputSchema,
 } from './lp-position.service.js';
 import { positionKey, valuePositions } from './valuation.service.js';
+
+function chainIdForChain(chain: 'robinhood' | 'bsc' | 'base' | undefined, override: number | undefined): number {
+  if (override !== undefined) return override;
+  if (chain === 'bsc') return 56;
+  if (chain === 'base') return 8453;
+  return 4663;
+}
+
+function publicClientForChain(chain: 'robinhood' | 'bsc' | 'base') {
+  if (chain === 'bsc') return publicClientBsc;
+  if (chain === 'base') return publicClientBase;
+  return publicClient;
+}
 
 export type PositionChangeField = {
   field: string;
@@ -61,7 +76,7 @@ export async function trackWalletPositions(input: unknown): Promise<TrackResult>
 
   const [read, blockNumber] = await Promise.all([
     getWalletUniswapPositions(query),
-    publicClient.getBlockNumber(),
+    publicClientForChain(query.chain).getBlockNumber(),
   ]);
 
   const valuation = await valuePositions(read.positions, read.chainId);
@@ -128,7 +143,7 @@ export async function getWalletHistory(input: unknown): Promise<HistoryResult> {
 
   return {
     wallet,
-    chainId: query.chainId ?? (query.chain === 'bsc' ? 56 : 4663),
+    chainId: chainIdForChain(query.chain, query.chainId),
     snapshots,
   };
 }
@@ -156,7 +171,7 @@ export async function getWalletDiff(input: unknown): Promise<DiffResult> {
 
   return {
     wallet,
-    chainId: query.chainId ?? (query.chain === 'bsc' ? 56 : 4663),
+    chainId: chainIdForChain(query.chain, query.chainId),
     previous,
     current,
     changes: diffPositions(previous.positions, current.positions),
