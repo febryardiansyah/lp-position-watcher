@@ -1,10 +1,19 @@
 import 'dotenv/config';
 
+import boxen from 'boxen';
+import chalk from 'chalk';
+import ora from 'ora';
 import { getAddress } from 'viem';
 
 import { env } from './config/env.js';
 import { getWalletUniswapPositions } from './services/lp-position.service.js';
-import { renderPortfolio } from './services/portfolio-view.service.js';
+import {
+  changeDelta,
+  relativeTime,
+  renderPortfolio,
+  shortAddr,
+  theme,
+} from './services/portfolio-view.service.js';
 import {
   getWalletDiff,
   getWalletHistory,
@@ -36,25 +45,31 @@ function rpcHints(errorMessage: string, chain: 'robinhood' | 'bsc' | 'base'): st
   return hints;
 }
 
-const USAGE = `Usage:
-  npm run dev -- <walletAddress>            Show LP portfolio (like lpagent.io) for a wallet
-  npm run dev -- positions <walletAddress>  Same as above
-  npm run dev -- positions --json <wallet>  Show raw JSON position data
-  npm run dev -- track <walletAddress>      Record a valuation snapshot and report changes since last one
-  npm run dev -- history <walletAddress>    List recorded snapshots for a wallet
-  npm run dev -- diff <walletAddress>       Diff the two most recent snapshots
-  npm run dev -- help                       Show this help
-
-Chain selection:
-  --chain <robinhood|bsc|base>   Which chain to read (default: robinhood).
-                                 'bsc' reads PancakeSwap v3 on BNB Smart Chain.
-                                 'base' reads Uniswap v2/v3/v4 on Base (chain 8453).
-
-Pagination options (portfolio view):
-  --limit <n>   Max closed positions per page (default 15)
-  --page <n>    Page of closed positions to show (default 1)
-
-The wallet can also be set with WALLET_ADDRESS in .env.`;
+const USAGE = [
+  chalk.cyan.bold('Usage:'),
+  `  ${chalk.bold('npm run dev --')} <walletAddress>             ${chalk.gray('Show LP portfolio for a wallet')}`,
+  `  ${chalk.bold('npm run dev -- positions')} <walletAddress>   ${chalk.gray('Same as above')}`,
+  `  ${chalk.bold('npm run dev -- positions --json <wallet>')}    ${chalk.gray('Show raw JSON position data')}`,
+  `  ${chalk.bold('npm run dev -- track')} <walletAddress>       ${chalk.gray('Record a valuation snapshot and report changes')}`,
+  `  ${chalk.bold('npm run dev -- history')} <walletAddress>     ${chalk.gray('List recorded snapshots for a wallet')}`,
+  `  ${chalk.bold('npm run dev -- diff')} <walletAddress>        ${chalk.gray('Diff the two most recent snapshots')}`,
+  `  ${chalk.bold('npm run dev -- help')}                        ${chalk.gray('Show this help')}`,
+  '',
+  chalk.yellow.bold('Chain selection:'),
+  `  ${chalk.green('--chain')} <robinhood|bsc|base>   Which chain to read (default: robinhood).`,
+  `                          ${chalk.gray("'bsc' reads PancakeSwap v3 on BNB Smart Chain.")}`,
+  `                          ${chalk.gray("'base' reads Uniswap v2/v3/v4 on Base (chain 8453).")}`,
+  '',
+  chalk.yellow.bold('Output options:'),
+  `  ${chalk.green('--no-color')}                    Disable ANSI color output`,
+  `  ${chalk.green('--json')}                        Emit raw JSON instead of pretty output`,
+  '',
+  chalk.yellow.bold('Pagination options (portfolio view):'),
+  `  ${chalk.green('--limit')} <n>   Max closed positions per page (default 15)`,
+  `  ${chalk.green('--page')} <n>    Page of closed positions to show (default 1)`,
+  '',
+  chalk.gray('The wallet can also be set with WALLET_ADDRESS in .env.'),
+].join('\n');
 
 function resolveWallet(walletArg: string | undefined): string {
   const walletInput = walletArg ?? env.WALLET_ADDRESS;
@@ -126,37 +141,104 @@ async function main() {
   switch (command) {
     case 'positions':
     case 'read': {
-      const read = await getWalletUniswapPositions(input);
+      const fetchSpinner = ora({
+        text: theme.muted(`Fetching LP positions for ${shortAddr(wallet)}…`),
+        color: 'cyan',
+      }).start();
+
+      let read;
+      try {
+        read = await getWalletUniswapPositions(input);
+      } catch (err) {
+        fetchSpinner.fail(theme.error('Failed to fetch positions'));
+        throw err;
+      }
+
+      const valSpinner = ora({
+        text: theme.muted(`Valuating ${read.positions.length} positions…`),
+        color: 'cyan',
+      }).start();
+
+      let valuation;
+      try {
+        valuation = await valuePositions(read.positions, read.chainId);
+      } catch (err) {
+        valSpinner.fail(theme.error('Valuation failed'));
+        throw err;
+      }
+
+      valSpinner.succeed(
+        theme.success(`Valued ${read.positions.length} positions at ${theme.value(formatUsd(valuation.totalUsd))}`),
+      );
 
       if (jsonOutput) {
         console.log(JSON.stringify(read, null, 2));
         return;
       }
 
-      const valuation = await valuePositions(read.positions, read.chainId);
       console.log(renderPortfolio(read, valuation, { limit, page }));
       return;
     }
 
     case 'track': {
-      const result = await trackWalletPositions(input);
+      const spinner = ora({
+        text: theme.muted(`Tracking wallet ${shortAddr(wallet)} on chain ${input.chainId}…`),
+        color: 'cyan',
+      }).start();
 
-      console.error(
-        [
-          `Tracked ${result.read.summary.positionsOpen} positions on chain ${result.chainId}.`,
-          `Total value: ${formatUsd(result.valuation.totalUsd)}`,
-          result.previous
-            ? `Previous snapshot (${result.previous.timestamp}): ${formatUsd(result.previous.totalUsd)}`
-            : 'First snapshot for this wallet; all positions marked as opened.',
-        ].join('\n'),
+      let result;
+      try {
+        result = await trackWalletPositions(input);
+      } catch (err) {
+        spinner.fail(theme.error('Tracking failed'));
+        throw err;
+      }
+
+      spinner.succeed(
+        theme.success(
+          `Snapshot saved ${theme.muted(`(${relativeTime(result.trackedAt)} · block ${result.blockNumber})`)}`,
+        ),
+      );
+
+      console.log('');
+      console.log(
+        boxen(
+          [
+            `${theme.muted('Wallet  ')} ${theme.wallet(shortAddr(result.wallet))}`,
+            `${theme.muted('Chain   ')} ${theme.chain(String(result.chainId))}`,
+            `${theme.muted('Total   ')} ${theme.value(formatUsd(result.valuation.totalUsd))}`,
+            result.previous
+              ? `${theme.muted('Previous')} ${theme.value(formatUsd(result.previous.totalUsd))}${changeDelta(
+                  result.valuation.totalUsd,
+                  result.previous.totalUsd,
+                )}`
+              : `${theme.muted('Previous')} ${theme.dim('— (first snapshot)')}`,
+            `${theme.muted('Open    ')} ${theme.value(`${result.read.summary.positionsOpen}`)}`,
+            `${theme.muted('By protoc')} ${theme.muted(
+              `v2:${result.read.summary.byProtocol.v2}  v3:${result.read.summary.byProtocol.v3}  v4:${result.read.summary.byProtocol.v4}`,
+            )}`,
+          ].join('\n'),
+          {
+            title: theme.brand(' Snapshot '),
+            titleAlignment: 'center',
+            padding: { top: 0, bottom: 0, left: 1, right: 1 },
+            borderStyle: 'round',
+            borderColor: 'green',
+          },
+        ),
       );
 
       const changeLines = summarizeChanges(result.changes);
       if (changeLines.length > 0) {
-        console.error(`Changes since last snapshot:\n${changeLines.join('\n')}`);
+        console.log('');
+        console.log(theme.subheading('  Changes since last snapshot'));
+        console.log(changeLines.join('\n'));
       } else {
-        console.error('No changes since last snapshot.');
+        console.log('');
+        console.log(theme.muted('  No changes since last snapshot.'));
       }
+
+      if (!jsonOutput) return;
 
       console.log(
         JSON.stringify(
@@ -180,19 +262,88 @@ async function main() {
     }
 
     case 'history': {
-      console.log(JSON.stringify(await getWalletHistory(input), null, 2));
+      const spinner = ora({
+        text: theme.muted(`Reading snapshot history for ${shortAddr(wallet)}…`),
+        color: 'cyan',
+      }).start();
+
+      let history;
+      try {
+        history = await getWalletHistory(input);
+      } catch (err) {
+        spinner.fail(theme.error('Failed to read history'));
+        throw err;
+      }
+
+      spinner.succeed(theme.success(`Found ${history.snapshots.length} snapshot(s)`));
+
+      if (history.snapshots.length === 0) {
+        console.log(theme.muted('  No snapshots yet. Run `track` to record one.'));
+        return;
+      }
+
+      const Table = (await import('cli-table3')).default;
+      const table = new Table({
+        head: [
+          theme.muted('#'),
+          theme.muted('When'),
+          theme.muted('Block'),
+          theme.muted('Positions'),
+          theme.muted('v2 / v3 / v4'),
+          theme.muted('Total USD'),
+        ].map((h) => chalk.reset(h)),
+        style: { head: [], border: [], 'padding-left': 1, 'padding-right': 1 },
+      });
+
+      history.snapshots.forEach((snap, i) => {
+        table.push([
+          theme.muted(`${i + 1}`),
+          `${chalk.cyan(new Date(snap.timestamp).toLocaleString())} ${theme.dim('(' + relativeTime(snap.timestamp) + ')')}`,
+          theme.muted(snap.blockNumber),
+          theme.value(`${snap.positionsCount}`),
+          theme.muted(`v2:${snap.byProtocol.v2}  v3:${snap.byProtocol.v3}  v4:${snap.byProtocol.v4}`),
+          theme.value(formatUsd(snap.totalUsd)),
+        ]);
+      });
+
+      console.log('');
+      console.log(theme.heading('  Snapshot history'));
+      console.log(table.toString());
+
+      if (jsonOutput) {
+        console.log(JSON.stringify(history, null, 2));
+      }
       return;
     }
 
     case 'diff': {
-      const result = await getWalletDiff(input);
+      const spinner = ora({
+        text: theme.muted(`Comparing last two snapshots for ${shortAddr(wallet)}…`),
+        color: 'cyan',
+      }).start();
+
+      let result;
+      try {
+        result = await getWalletDiff(input);
+      } catch (err) {
+        spinner.fail(theme.error('Diff failed'));
+        throw err;
+      }
+
+      spinner.succeed(theme.success('Diff complete'));
+
       const lines = summarizeChanges(result.changes);
 
       if (lines.length > 0) {
-        console.error(`Changes between last two snapshots:\n${lines.join('\n')}`);
+        console.log('');
+        console.log(theme.subheading('  Changes between last two snapshots'));
+        console.log(lines.join('\n'));
       } else {
-        console.error('No changes between last two snapshots.');
+        console.log('');
+        console.log(theme.muted('  No changes between last two snapshots.'));
       }
+
+      if (!jsonOutput) return;
 
       console.log(
         JSON.stringify(
@@ -218,13 +369,26 @@ async function main() {
 
 main().catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
-  console.error(message);
+
+  console.error(
+    boxen(
+      [theme.error('✖ Error'), '', message].join('\n'),
+      {
+        title: chalk.red(' Failed '),
+        titleAlignment: 'center',
+        padding: { top: 0, bottom: 0, left: 1, right: 1 },
+        borderStyle: 'round',
+        borderColor: 'red',
+      },
+    ),
+  );
 
   const hints = rpcHints(message, currentChain);
   if (hints.length > 0) {
-    console.error('\nHints:');
+    console.error('');
+    console.error(theme.warn('  Hints'));
     for (const hint of hints) {
-      console.error(`- ${hint}`);
+      console.error(`    ${theme.muted('•')} ${hint}`);
     }
   }
 

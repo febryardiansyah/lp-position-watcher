@@ -1,3 +1,4 @@
+import chalk from 'chalk';
 import { getAddress, type Address } from 'viem';
 
 import { publicClientBase } from '../lib/base-public-client.js';
@@ -265,18 +266,20 @@ export function summarizeChanges(changes: PositionChange[]): string[] {
 
   for (const change of changes) {
     if (change.kind === 'opened') {
-      lines.push(`  opened ${positionLabel(change.position)}`);
+      lines.push(`  ${chalk.green('+ opened')}  ${positionLabel(change.position)}`);
       continue;
     }
 
     if (change.kind === 'closed') {
-      lines.push(`  closed ${positionLabel(change.position)}`);
+      lines.push(`  ${chalk.red('− closed')}  ${positionLabel(change.position)}`);
       continue;
     }
 
-    lines.push(`  updated ${positionLabel(change.position)}`);
+    lines.push(`  ${chalk.yellow('~ updated')}  ${positionLabel(change.position)}`);
     for (const field of change.fields) {
-      lines.push(`    ${field.field}: ${field.from} -> ${field.to}`);
+      const from = chalk.gray(field.from);
+      const to = chalk.cyan(field.to);
+      lines.push(`      ${chalk.dim(field.field)}: ${from}  ${chalk.dim('→')}  ${to}`);
     }
   }
 
