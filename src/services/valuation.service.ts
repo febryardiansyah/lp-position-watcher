@@ -107,7 +107,8 @@ export function isUsdStablecoin(token: string, chainId: number): boolean {
   const normalized = getAddress(token).toLowerCase();
   if (chainId === ROBINHOOD_CHAIN.id) {
     return normalized === '0x9702230a8ea53601f5cd2dc00fdbc13d4df174a8' // USDC.e on RH
-      || normalized === '0x6dcb1d9b6b4d13683dd3ee10b27ae3d6f4b4c4cd'; // USDC on RH
+      || normalized === '0x6dcb1d9b6b4d13683dd3ee10b27ae3d6f4b4c4cd' // USDC on RH
+      || normalized === '0x5fc5360d0400a0fd4f2af552add042d716f1d168'; // USDG on RH
   }
   if (chainId === BSC_CONFIG.id) return STABLECOIN_ADDRESSES_BSC.has(normalized);
   if (chainId === BASE_CONFIG.id) return STABLECOIN_ADDRESSES_BASE.has(normalized);
