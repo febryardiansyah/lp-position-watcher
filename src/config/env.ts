@@ -9,6 +9,8 @@ const envSchema = z.object({
   BSC_RPC_URL: z.url().optional(),
   BSCSCAN_API_KEY: z.string().optional(),
   BSC_CHAIN_ID: z.coerce.number().int().positive().default(56),
+  BASE_CHAIN_ID: z.coerce.number().int().positive().default(8453),
+  BASE_RPC_URL: z.url().optional(),
   WALLET_ADDRESS: z
     .string()
     .regex(/^0x[a-fA-F0-9]{40}$/, 'WALLET_ADDRESS must be a valid EVM address')

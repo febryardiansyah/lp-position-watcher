@@ -26,6 +26,7 @@ export const BSC_CONFIG = {
   ],
   multicall3: '0xcA11bde05977b3631167028862bE2a173976CA11',
   explorerBscscanBase: 'https://api.bscscan.com/api',
+  blockscoutApiBase: null,
   dexscreenerChainId: 'bsc',
   pancake: {
     v3Factory: '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865',
@@ -33,4 +34,30 @@ export const BSC_CONFIG = {
   },
 } as const;
 
-export type ChainName = 'robinhood' | 'bsc';
+export const UNISWAP_BASE_CONTRACTS = {
+  v2Factory: '0x8909dc15e40173ff4699343b6eb8132c65e18ec6',
+  v3Factory: '0x33128a8fc17869897dce68ed026d694621f6fdfd',
+  v3NonfungiblePositionManager: '0x03a520b32c04bf3beef7beb72e919cf822ed34f1',
+  v4PoolManager: '0x498581ff718922c3f8e6a244956af099b2652b2b',
+  v4PositionManager: '0x7c5f5a4bbd8fd63184577525326123b519429bdc',
+  v4StateView: '0xa3c0c9b65bad0b08107aa264b0f3db444b867a71',
+} as const;
+
+export const BASE_CONFIG = {
+  id: 8453,
+  name: 'Base',
+  nativeSymbol: 'ETH',
+  wrappedSymbol: 'WETH',
+  wrappedAddress: '0x4200000000000000000000000000000000000006',
+  rpcFallbacks: [
+    'https://base-rpc.publicnode.com',
+    'https://mainnet.base.org',
+    'https://1rpc.io/base',
+  ],
+  multicall3: '0xcA11bde05977b3631167028862bE2a173976CA11',
+  blockscoutApiBase: 'https://base.blockscout.com/api',
+  dexscreenerChainId: 'base',
+  uniswap: UNISWAP_BASE_CONTRACTS,
+} as const;
+
+export type ChainName = 'robinhood' | 'bsc' | 'base';

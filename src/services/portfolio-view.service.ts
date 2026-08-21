@@ -1,7 +1,89 @@
+import boxen from 'boxen';
+import chalk from 'chalk';
+import Table from 'cli-table3';
+
 import type { AnyPosition, WalletLpReadResult } from './lp-position.service.js';
 import { formatUsd, positionKey, type WalletValuation } from './valuation.service.js';
 
-type PortfolioRow = {
+const NO_COLOR = process.env.NO_COLOR === '1' || process.argv.includes('--no-color');
+
+if (NO_COLOR) {
+  process.env.FORCE_COLOR = '0';
+}
+
+export const theme = {
+  brand: chalk.hex('#FF6600').bold,
+  brandDim: chalk.hex('#FF6600'),
+  heading: chalk.bold.cyan,
+  subheading: chalk.bold,
+  wallet: chalk.bold.magenta,
+  chain: chalk.bold.blue,
+  value: chalk.bold.green,
+  valueMuted: chalk.gray,
+  positive: chalk.green,
+  positiveBold: chalk.green.bold,
+  negative: chalk.red,
+  negativeBold: chalk.red.bold,
+  neutral: chalk.yellow,
+  muted: chalk.gray,
+  dim: chalk.dim,
+  inRange: chalk.greenBright,
+  outOfRange: chalk.redBright,
+  pool: chalk.bold.cyan,
+  token: chalk.cyan,
+  protocol: chalk.magenta,
+  fee: chalk.yellow,
+  success: chalk.green,
+  warn: chalk.yellow,
+  error: chalk.red,
+  opened: chalk.green,
+  closed: chalk.red,
+  modified: chalk.yellow,
+};
+
+export type Palette = typeof theme;
+
+export function valueBold(value: number | null): string {
+  const text = formatUsd(value);
+  if (value === null) return theme.muted(text);
+  return theme.value(text);
+}
+
+export function shortAddr(address: string): string {
+  return `${address.slice(0, 6)}…${address.slice(-4)}`;
+}
+
+export function relativeTime(iso: string | null | undefined): string {
+  if (!iso) return '—';
+  const ms = Date.now() - Date.parse(iso);
+  if (!Number.isFinite(ms)) return '—';
+  if (ms < 0) return new Date(iso).toLocaleString();
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ${minutes % 60}m ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d ${hours % 24}h ago`;
+  const months = Math.floor(days / 30);
+  if (months < 12) return `${months}mo ago`;
+  const years = Math.floor(days / 365);
+  return `${years}y ago`;
+}
+
+export function changeDelta(current: number | null, previous: number | null): string {
+  if (current === null || previous === null) return '';
+  const diff = current - previous;
+  if (Math.abs(diff) < 0.01) return theme.muted(' (±$0.00)');
+  const pct = previous !== 0 ? (diff / previous) * 100 : 0;
+  const sign = diff >= 0 ? '+' : '−';
+  return theme.muted(
+    ` (${sign}${formatUsd(Math.abs(diff))}, ${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%)`,
+  );
+}
+
+export type PortfolioRow = {
   index: number;
   pool: string;
   protocol: string;
@@ -16,6 +98,7 @@ type PortfolioRow = {
 export type PortfolioViewOptions = {
   limit?: number;
   page?: number;
+  previousTotalUsd?: number | null;
 };
 
 const DEFAULT_PAGE_LIMIT = 15;
@@ -25,7 +108,7 @@ export function renderPortfolio(
   valuation: WalletValuation,
   options: PortfolioViewOptions = {},
 ): string {
-  const lines: string[] = [];
+  const outBuf: string[] = [];
 
   const open = read.positions.filter((position) => positionOpen(position));
   const closed = read.positions.filter((position) => !positionOpen(position));
@@ -42,45 +125,165 @@ export function renderPortfolio(
     (position) => position.protocol !== 'v2' && position.inRange === false,
   ).length;
 
-  lines.push(`Wallet: ${read.wallet}`);
-  lines.push(`Chain: ${chainLabel(read)}`);
-  lines.push('');
-  lines.push(`Total Value: ${formatUsd(valuation.totalUsd)}`);
-  lines.push(
-    `Positions: ${read.summary.positionsOpen} (v2: ${read.summary.byProtocol.v2}, v3: ${read.summary.byProtocol.v3}, v4: ${read.summary.byProtocol.v4})`,
+  outBuf.push(
+    boxen(
+      [
+        theme.wallet(shortAddr(read.wallet)),
+        theme.dim('full: '),
+        theme.muted(read.wallet),
+      ].join('\n'),
+      {
+        title: theme.brand(' LP Portfolio '),
+        titleAlignment: 'center',
+        padding: { top: 0, bottom: 0, left: 1, right: 1 },
+        margin: { top: 0, bottom: 0, left: 0, right: 0 },
+        borderStyle: 'round',
+        borderColor: 'cyan',
+      },
+    ),
   );
-  if (read.chainName === 'bsc') {
-    lines.push(`Providers: uniswap ${read.summary.byProvider.uniswap}, pancake ${read.summary.byProvider.pancake}`);
-  }
-  lines.push(
-    `In range: ${inRangeCount}   Out of range: ${outOfRangeCount}   Unclaimed fees: ${formatUsd(valuation.feesUsd)}`,
+
+  outBuf.push(
+    theme.dim('  Chain: ') + theme.chain(chainLabel(read)),
+    '',
+    theme.subheading('  Summary'),
+    `    ${theme.muted('Total value  ')} ${valueBold(valuation.totalUsd)}`,
+    `    ${theme.muted('Unclaimed    ')} ${theme.neutral(formatUsd(valuation.feesUsd))}`,
+    `    ${theme.muted('Positions    ')} ${theme.value(`${open.length}`)}`,
+    `    ${theme.muted('In range     ')} ${theme.inRange(`${inRangeCount}`)}`,
+    `    ${theme.muted('Out of range ')} ${theme.outOfRange(`${outOfRangeCount}`)}`,
+    '',
   );
-  lines.push('');
 
   if (open.length > 0) {
-    lines.push(renderTable('Open positions', open, valuation));
+    outBuf.push(renderPositionsTable('Open positions', open, valuation, 'open'));
   }
 
   if (closedPage.length > 0) {
-    lines.push(renderTable('Empty/closed positions', closedPage, valuation));
+    outBuf.push(renderPositionsTable('Empty / closed positions', closedPage, valuation, 'closed'));
 
     if (closed.length > limit) {
       const from = closedOffset + 1;
       const to = closedOffset + closedPage.length;
-      lines.push('');
-      lines.push(
-        `Showing closed positions ${from}-${to} of ${closed.length}. Use --page <n> --limit <n> to page through them.`,
+      outBuf.push(
+        theme.muted(
+          `Showing closed positions ${from}-${to} of ${closed.length}. Use --page <n> --limit <n> to navigate.`,
+        ),
       );
     }
   }
 
-  lines.push('');
-
-  for (const note of read.notes) {
-    lines.push(`- ${note}`);
+  if (open.length === 0 && closedPage.length === 0) {
+    outBuf.push(theme.muted('  No positions found.'));
   }
 
-  return lines.join('\n');
+  if (read.notes.length > 0) {
+    outBuf.push('');
+    outBuf.push(theme.subheading('  Notes'));
+    for (const note of read.notes) {
+      outBuf.push(`    ${theme.muted('•')} ${note}`);
+    }
+  }
+
+  return outBuf.filter(Boolean).join('\n');
+}
+
+function renderPositionsTable(
+  title: string,
+  positions: AnyPosition[],
+  valuation: WalletValuation,
+  kind: 'open' | 'closed',
+): string {
+  const table = new Table({
+    head: [
+      theme.muted('#'),
+      theme.muted('Pool'),
+      theme.muted('Value'),
+      theme.muted('Range'),
+      theme.muted('Unclaimed'),
+      theme.muted('Age'),
+      theme.muted('Fee'),
+      theme.muted('Tick range'),
+    ].map((h) => chalk.reset(h)),
+    style: {
+      head: [],
+      border: [],
+      'padding-left': 1,
+      'padding-right': 1,
+    },
+    wordWrap: true,
+    colAligns: ['right', 'left', 'right', 'center', 'right', 'right', 'right', 'left'],
+  });
+
+  positions.forEach((position, offset) => {
+    table.push(buildRow(position, offset + 1, valuation, kind));
+  });
+
+  const headerLine =
+    kind === 'open'
+      ? theme.heading(`  ${title}`) + theme.muted(`  (${positions.length})`)
+      : theme.muted(`  ${title}`) + theme.muted(`  (${positions.length})`);
+
+  return `\n${headerLine}\n${table.toString()}`;
+}
+
+function buildRow(
+  position: AnyPosition,
+  index: number,
+  valuation: WalletValuation,
+  kind: 'open' | 'closed',
+): string[] {
+  const v = valuation.perPosition[positionKey(position)];
+
+  let pool = '';
+  let inRange = '—';
+  let fee = '—';
+  let range = '';
+
+  if (position.protocol === 'v2') {
+    pool = theme.pool(position.pairSymbol);
+  } else {
+    const token0 = position.token0;
+    const token1 = position.token1;
+    const basePool = token0 && token1 ? `${token0.symbol}/${token1.symbol}` : `#${position.tokenId}`;
+    pool =
+      position.protocol === 'v3' && position.provider === 'pancake'
+        ? `${theme.muted('[pancake]')} ${theme.pool(basePool)}`
+        : theme.pool(basePool);
+
+    if (position.protocol === 'v3') {
+      inRange = position.inRange ? theme.inRange('● in') : theme.outOfRange('● out');
+      fee = theme.fee(formatFeeBps(position.feeTier));
+      range = `${position.tickLower} → ${position.tickUpper}`;
+    } else if (position.inRange !== null) {
+      inRange = position.inRange ? theme.inRange('● in') : theme.outOfRange('● out');
+      fee = position.lpFee !== null ? theme.fee(formatFeeBps(position.lpFee)) : '—';
+      range = `${position.tickLower} → ${position.tickUpper}`;
+    }
+  }
+
+  const unclaimedUsd = v?.feesUsd ?? null;
+  const unclaimedLabel = unclaimedAmounts(position);
+  const unclaimedFormatted = unclaimedUsd !== null ? formatUsd(unclaimedUsd) : '';
+  const unclaimedCombined =
+    unclaimedUsd !== null
+      ? `${theme.neutral(unclaimedFormatted)}${unclaimedLabel ? theme.muted(` (${unclaimedLabel})`) : ''}`
+      : unclaimedLabel;
+
+  const valueFormatted = v?.totalUsd !== undefined && v?.totalUsd !== null
+    ? theme.value(formatUsd(v.totalUsd))
+    : theme.muted('—');
+
+  return [
+    theme.muted(`${index}`),
+    pool,
+    valueFormatted,
+    kind === 'closed' ? theme.muted(inRange) : inRange,
+    unclaimedCombined || theme.muted('—'),
+    theme.muted(formatAge(position.createdAt)),
+    fee,
+    theme.muted(range),
+  ];
 }
 
 function positionOpen(position: AnyPosition): boolean {
@@ -107,85 +310,6 @@ function positionOpen(position: AnyPosition): boolean {
   );
 }
 
-function renderTable(
-  title: string,
-  positions: AnyPosition[],
-  valuation: WalletValuation,
-): string {
-  const rows: PortfolioRow[] = positions.map((position, offset) =>
-    buildRow(position, offset + 1, valuation),
-  );
-
-  const widths = columnWidths(rows);
-
-  const header = ['#', 'Pool', 'Value', 'In range', 'Unclaimed', 'Age', 'Fee', 'Range']
-    .map((cell, index) => cell.padEnd(widths[index]))
-    .join('  ')
-    .trimEnd();
-
-  const separator = '─'.repeat(Math.max(header.length, 20));
-
-  const body = rows.map((row) =>
-    [
-      row.index.toString().padEnd(widths[0]),
-      row.pool.padEnd(widths[1]),
-      row.value.padEnd(widths[2]),
-      row.inRange.padEnd(widths[3]),
-      row.unclaimed.padEnd(widths[4]),
-      row.age.padEnd(widths[5]),
-      row.fee.padEnd(widths[6]),
-      row.range.padEnd(widths[7]),
-    ]
-      .join('  ')
-      .trimEnd(),
-  );
-
-  return [title, header, separator, ...body].join('\n');
-}
-
-function buildRow(position: AnyPosition, index: number, valuation: WalletValuation): PortfolioRow {
-  const v = valuation.perPosition[positionKey(position)];
-
-  let pool = '';
-  let inRange = '—';
-  let fee = '—';
-  let range = '';
-
-  if (position.protocol === 'v2') {
-    pool = position.pairSymbol;
-  } else {
-    const token0 = position.token0;
-    const token1 = position.token1;
-    const basePool = token0 && token1 ? `${token0.symbol}/${token1.symbol}` : `#${position.tokenId}`;
-    pool = position.protocol === 'v3' && position.provider === 'pancake' ? `[pancake] ${basePool}` : basePool;
-
-    if (position.protocol === 'v3') {
-      inRange = position.inRange ? 'yes' : 'no';
-      fee = formatFeeBps(position.feeTier);
-      range = `${position.tickLower} → ${position.tickUpper}`;
-    } else if (position.inRange !== null) {
-      inRange = position.inRange ? 'yes' : 'no';
-      fee = position.lpFee !== null ? formatFeeBps(position.lpFee) : '—';
-      range = `${position.tickLower} → ${position.tickUpper}`;
-    }
-  }
-
-  const unclaimedUsd = v?.feesUsd ?? null;
-  const unclaimedLabel = unclaimedAmounts(position);
-
-  return {
-    index,
-    pool,
-    protocol: position.protocol,
-    value: formatUsd(v?.totalUsd ?? null),
-    inRange,
-    unclaimed: unclaimedUsd !== null ? `${formatUsd(unclaimedUsd)}${unclaimedLabel ? ` (${unclaimedLabel})` : ''}` : unclaimedLabel,
-    age: formatAge(position.createdAt),
-    fee,
-    range,
-  };
-}
-
 function unclaimedAmounts(position: AnyPosition): string {
   if (position.protocol === 'v2') return '';
 
@@ -199,24 +323,6 @@ function unclaimedAmounts(position: AnyPosition): string {
   if (fee0 === '0' && fee1 === '0') return '';
 
   return `${fee0} ${token0.symbol} + ${fee1} ${token1.symbol}`;
-}
-
-function columnWidths(rows: PortfolioRow[]): number[] {
-  const header = ['#', 'Pool', 'Value', 'In range', 'Unclaimed', 'Age', 'Fee', 'Range'];
-  const initial = header.map((cell) => cell.length);
-
-  for (const row of rows) {
-    initial[0] = Math.max(initial[0], row.index.toString().length);
-    initial[1] = Math.max(initial[1], row.pool.length);
-    initial[2] = Math.max(initial[2], row.value.length);
-    initial[3] = Math.max(initial[3], row.inRange.length);
-    initial[4] = Math.max(initial[4], row.unclaimed.length);
-    initial[5] = Math.max(initial[5], row.age.length);
-    initial[6] = Math.max(initial[6], row.fee.length);
-    initial[7] = Math.max(initial[7], row.range.length);
-  }
-
-  return initial;
 }
 
 function formatFeeBps(feeBps: number): string {
@@ -250,5 +356,6 @@ function trimAmount(value: string): string {
 
 function chainLabel(read: WalletLpReadResult): string {
   if (read.chainName === 'bsc') return `BNB Smart Chain (${read.chainId})`;
+  if (read.chainName === 'base') return `Base (${read.chainId})`;
   return `Robinhood Chain (${read.chainId})`;
 }
