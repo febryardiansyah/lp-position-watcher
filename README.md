@@ -1,4 +1,4 @@
-# Robinhood Chain & BSC LP Position CLI
+# Robinhood Chain, BSC & Base Chain LP Position CLI
 
 A CLI tool that reads a wallet's LP positions and displays them in a portfolio view — including USD value, in-range status, uncollected fees, position age, and fee tier. It also supports snapshot-based tracking and diffing for PnL-style analysis.
 
